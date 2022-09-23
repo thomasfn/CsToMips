@@ -27,6 +27,19 @@ namespace CsToMips.Compiler
             this.operands = operands.ToArray();
         }
 
+        public IC10Instruction ReplaceOperand(int operandIndex, string newValue)
+        {
+            if (operandIndex < 0 || operandIndex >= operands.Length) { throw new ArgumentOutOfRangeException(nameof(operandIndex)); }
+            var newOperands = new string[operands.Length];
+            Operands.CopyTo(newOperands);
+            newOperands[operandIndex] = newValue;
+            return new IC10Instruction(OpCode, Kind, newOperands);
+        }
+
+        public bool IsUnconditionalJump => Kind == IC10InstructionKind.Instruction && (OpCode == "j" || OpCode == "jal");
+
+        public bool IsUnconditionalJumpNoReturn => Kind == IC10InstructionKind.Instruction && OpCode == "j";
+
         public override string ToString() => Kind == IC10InstructionKind.Instruction ? $"{OpCode.ToLowerInvariant()} {string.Join(" ", operands)}" : $"{OpCode}:";
     }
 
@@ -69,8 +82,11 @@ namespace CsToMips.Compiler
             do
             {
                 changesMade = false;
-                //changesMade |= Optimise_RedundantStackUsage(instructions);
-                //changesMade |= Optimise_RedundantJumps(instructions);
+                changesMade |= Optimise_RedundantStackUsage(instructions);
+                changesMade |= Optimise_RedundantJumps(instructions);
+                changesMade |= Optimise_InlineSmallSections(instructions);
+                changesMade |= Optimise_ChainLabels(instructions);
+                changesMade |= Optimise_UnusedLabels(instructions);
             }
             while (changesMade);
         }
@@ -93,6 +109,7 @@ namespace CsToMips.Compiler
 
         private bool Optimise_RedundantJumps(IList<IC10Instruction> instructions)
         {
+            bool changesMade = false;
             for (int i = 0; i < instructions.Count - 1; ++i)
             {
                 var instruction = instructions[i];
@@ -101,9 +118,119 @@ namespace CsToMips.Compiler
                 {
                     instructions.RemoveAt(i);
                     --i;
+                    changesMade |= true;
                 }
             }
-            return false;
+            return changesMade;
+        }
+
+        private bool Optimise_InlineSmallSections(IList<IC10Instruction> instructions)
+        {
+            bool changesMade = false;
+            for (int i = 0; i < instructions.Count - 1; ++i)
+            {
+                var instruction = instructions[i];
+                var nextInstruction = instructions[i + 1];
+                if (instruction.Kind == IC10InstructionKind.Label)
+                {
+                    var sectionSize = GetSectionFiniteSize(instructions, instruction.OpCode);
+                    if (sectionSize == null || sectionSize > 1) { continue; }
+                    var refs = FindLabelRefs(instructions, instruction.OpCode).ToArray();
+                    foreach (var (instructionIndex, _) in refs)
+                    {
+                        if (instructions[instructionIndex].IsUnconditionalJumpNoReturn)
+                        {
+                            instructions[instructionIndex] = nextInstruction;
+                            changesMade |= true;
+                        }
+                        // TODO: the ref could be a conditional jump e.g. begz, we could still inline the section IF the section only consists of a single "j"
+                    }
+                    
+                }
+            }
+            return changesMade;
+        }
+
+        private bool Optimise_ChainLabels(IList<IC10Instruction> instructions)
+        {
+            bool changesMade = false;
+            for (int i = 0; i < instructions.Count - 1; ++i)
+            {
+                var instruction = instructions[i];
+                var nextInstruction = instructions[i + 1];
+                if (instruction.Kind != IC10InstructionKind.Label || nextInstruction.Kind != IC10InstructionKind.Label) { continue; }
+                FixupLabelRefs(instructions, nextInstruction.OpCode, instruction.OpCode);
+                instructions.RemoveAt(i + 1);
+                changesMade |= true;
+            }
+            return changesMade;
+        }
+
+        private bool Optimise_UnusedLabels(IList<IC10Instruction> instructions)
+        {
+            bool changesMade = false;
+            for (int i = 0; i < instructions.Count; ++i)
+            {
+                var instruction = instructions[i];
+                if (instruction.Kind == IC10InstructionKind.Label && !FindLabelRefs(instructions, instruction.OpCode).Any())
+                {
+                    instructions.RemoveAt(i);
+                    --i;
+                    changesMade |= true;
+                }
+            }
+            return changesMade;
+        }
+
+        private bool FixupLabelRefs(IList<IC10Instruction> instructions, string labelName, string replaceLabelName)
+        {
+            bool changesMade = false;
+            foreach (var (instructionIndex, operandIndex) in FindLabelRefs(instructions, labelName))
+            {
+                if (instructions[instructionIndex].Operands[operandIndex] != labelName) { continue; }
+                instructions[instructionIndex] = instructions[instructionIndex].ReplaceOperand(operandIndex, replaceLabelName);
+                changesMade |= true;
+            }
+            return changesMade;
+        }
+
+        private IEnumerable<(int instructionIndex, int operandIndex)> FindLabelRefs(IList<IC10Instruction> instructions, string labelName)
+        {
+            for (int i = 0; i < instructions.Count; ++i)
+            {
+                var instruction = instructions[i];
+                for (int j = 0; j < instruction.Operands.Length; ++j)
+                {
+                    if (instruction.Operands[j] != labelName) { continue; }
+                    yield return (i, j);
+                }
+            }
+        }
+
+        private int? GetSectionFiniteSize(IList<IC10Instruction> instructions, string labelName)
+        {
+            int? sectionStart = FindLabel(instructions, labelName);
+            if (sectionStart == null) { return null; }
+            int length = 0;
+            for (int i = sectionStart.Value + 1; i < instructions.Count; ++i)
+            {
+                ++length;
+                if (instructions[i].IsUnconditionalJumpNoReturn) { break; }
+            }
+            return length;
+        }
+
+        private int? FindLabel(IList<IC10Instruction> instructions, string labelName)
+        {
+            for (int i = 0; i < instructions.Count; ++i)
+            {
+                var instruction = instructions[i];
+                if (instruction.Kind == IC10InstructionKind.Label && instruction.OpCode == labelName)
+                {
+                    return i;
+                }
+            }
+            return null;
         }
     }
 }

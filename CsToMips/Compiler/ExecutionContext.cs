@@ -312,6 +312,21 @@ namespace CsToMips.Compiler
                     outputWriter.SetCode(instructionIndex, sb.ToString().Trim());
                     return;
                 }
+                else if (callTarget is DeviceStackValue deviceStackValue && methodInfo.Name.StartsWith("Get"))
+                {
+                    if (!deviceStackValue.Multicast) { throw new InvalidOperationException($"Tried to do multicast device read on non-multicast device pin"); }
+                    string propertyName = method.Name[3..];
+                    var regIdx = AllocateRegister();
+                    var regValue = new RegisterStackValue { RegisterIndex = regIdx };
+                    int typeHash = deviceStackValue.DeviceType.GetCustomAttribute<DeviceInterfaceAttribute>()?.TypeHash ?? 0;
+                    outputWriter.SetCode(instructionIndex, $"lb {regValue.AsIC10} {typeHash} {callTarget.AsIC10} {propertyName} {paramValues[0].AsIC10}");
+                    valueStack.Push(regValue);
+                    for (int i = 0; i < ps.Length; ++i)
+                    {
+                        CheckFree(paramValues[i]);
+                    }
+                    return;
+                }
                 throw new InvalidOperationException($"Can't call unsupported method '{method}'");
             }
 

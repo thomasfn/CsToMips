@@ -13,8 +13,8 @@
 
     public enum MulticastAggregationMode
     {
-        Sum,
         Average,
+        Sum,
         Max,
         Min
     }

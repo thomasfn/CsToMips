@@ -18,16 +18,4 @@
         Max,
         Min
     }
-
-    public interface ICommonDevice
-    {
-        bool On { get; set; }
-        int PrefabHash { get; }
-    }
-
-    public interface ICommonMulticastDevice
-    {
-        bool On { set; }
-        bool GetOn(MulticastAggregationMode mode);
-    }
 }

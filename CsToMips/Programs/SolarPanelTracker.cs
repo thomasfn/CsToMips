@@ -7,14 +7,14 @@
     internal class SolarPanelTracker : IStationeersProgram
     {
         [Device("dDaylightSensor", 0)]
-        IDaylightSensor DaylightSensor;
+        IStructureDaylightSensor DaylightSensor;
 
         [MulticastDevice]
-        IMulticastSolarPanel SolarPanels;
+        IMulticastStructureSolarPanelDual SolarPanels;
 
         public void Run()
         {
-            DaylightSensor.Mode = 2;
+            DaylightSensor.Mode = StructureDaylightSensorMode.Vertical;
             DaylightSensor.On = true;
             while (true)
             {

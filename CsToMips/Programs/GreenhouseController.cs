@@ -14,19 +14,19 @@
         }
 
         [Device("dGasSensor", 0)]
-        IGasSensor GasSensor;
+        IStructureGasSensor GasSensor;
 
         [Device("dDaylightSensor", 1)]
-        IDaylightSensor DaylightSensor;
+        IStructureDaylightSensor DaylightSensor;
 
         [MulticastDevice]
-        IMulticastWallHeater WallHeaters;
+        IMulticastStructureWallHeater WallHeaters;
 
         [MulticastDevice]
-        IMulticastWallCooler WallCoolers;
+        IMulticastStructureWallCooler WallCoolers;
 
         [MulticastDevice]
-        IMulticastGrowLight GrowLights;
+        IMulticastStructureGrowLight GrowLights;
 
         HeatState heatState = 0;
         const float TargetTemp = 31.0f;

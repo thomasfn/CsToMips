@@ -73,7 +73,7 @@ namespace CsToMips.Compiler
             var instructions = ILView.ToOpCodes(method).ToArray();
             var outputWriter = new OutputWriter(instructions.Length);
             outputWriter.LabelPrefix = methodName ?? "";
-            var context = new ExecutionContext(reservedRegisters, method);
+            var context = new ExecutionContext(reservedRegisters, method, false);
             methodContextMap.Add(method, (context, outputWriter));
             context.Compile(instructions, outputWriter);
             foreach (var depMethod in context.MethodDependencies)

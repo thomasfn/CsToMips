@@ -86,13 +86,16 @@ namespace CsToMips.Compiler
                 changesMade |= Optimise_RedundantJumps(instructions);
                 changesMade |= Optimise_InlineSmallSections(instructions);
                 changesMade |= Optimise_ChainLabels(instructions);
+                changesMade |= Optimise_ChainJumps(instructions);
                 changesMade |= Optimise_UnusedLabels(instructions);
+                changesMade |= Optimise_UnreachableCode(instructions);
             }
             while (changesMade);
         }
 
         private bool Optimise_RedundantStackUsage(IList<IC10Instruction> instructions)
         {
+            bool changesMade = false;
             for (int i = 0; i < instructions.Count - 1; ++i)
             {
                 var instruction = instructions[i];
@@ -102,9 +105,10 @@ namespace CsToMips.Compiler
                     instructions.RemoveAt(i + 1);
                     instructions.RemoveAt(i);
                     --i;
+                    changesMade |= true;
                 }
             }
-            return false;
+            return changesMade;
         }
 
         private bool Optimise_RedundantJumps(IList<IC10Instruction> instructions)
@@ -166,6 +170,20 @@ namespace CsToMips.Compiler
             return changesMade;
         }
 
+        private bool Optimise_ChainJumps(IList<IC10Instruction> instructions)
+        {
+            bool changesMade = false;
+            for (int i = 0; i < instructions.Count - 1; ++i)
+            {
+                var instruction = instructions[i];
+                var nextInstruction = instructions[i + 1];
+                if (instruction.Kind != IC10InstructionKind.Label || !(nextInstruction.Kind == IC10InstructionKind.Instruction && nextInstruction.OpCode == "j")) { continue; }
+                FixupLabelRefs(instructions, instruction.OpCode, nextInstruction.Operands[0]);
+                changesMade |= true;
+            }
+            return changesMade;
+        }
+
         private bool Optimise_UnusedLabels(IList<IC10Instruction> instructions)
         {
             bool changesMade = false;
@@ -177,6 +195,25 @@ namespace CsToMips.Compiler
                     instructions.RemoveAt(i);
                     --i;
                     changesMade |= true;
+                }
+            }
+            return changesMade;
+        }
+
+        private bool Optimise_UnreachableCode(IList<IC10Instruction> instructions)
+        {
+            bool changesMade = false;
+            for (int i = 0; i < instructions.Count; ++i)
+            {
+                var instruction = instructions[i];
+                if (instruction.Kind == IC10InstructionKind.Instruction && instruction.OpCode == "j")
+                {
+                    ++i;
+                    while (i < instructions.Count && instructions[i].Kind != IC10InstructionKind.Label)
+                    {
+                        instructions.RemoveAt(i);
+                        changesMade |= true;
+                    }
                 }
             }
             return changesMade;

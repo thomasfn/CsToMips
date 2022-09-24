@@ -23,7 +23,7 @@
                 float actualPower = StationBatteries.GetCharge(MulticastAggregationMode.Sum) + LargeStationBatteries.GetCharge(MulticastAggregationMode.Sum);
                 float chargeRatio = actualPower / maxPower;
                 ChargeDisplay.Setting = chargeRatio;
-                IC10.Yield();
+                IC10Helpers.Yield();
             }
         }
     }

@@ -6,7 +6,6 @@ using System.Text.RegularExpressions;
 namespace CsToMips.Compiler
 {
     using Devices;
-    using System.Threading;
 
     [AttributeUsage(AttributeTargets.Method, Inherited = false, AllowMultiple = true)]
     internal sealed class OpCodeHandlerAttribute : Attribute
@@ -42,7 +41,7 @@ namespace CsToMips.Compiler
         private RegisterAllocations allUsedRegisters;
         private readonly RegisterAllocations reservedRegisters;
         private readonly MethodBase method;
-        private readonly ISet<MethodInfo> methodDependencies;
+        private readonly ISet<MethodBase> methodDependencies;
         private readonly IList<(int instructionIndex, RegisterAllocations registersInUse, MethodBase method)> callSites;
         private readonly int[] paramIndexToRegister;
 
@@ -63,11 +62,9 @@ namespace CsToMips.Compiler
             { typeof(Math).GetMethod("Sin", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "sin $ #0" },
             { typeof(Math).GetMethod("Sqrt", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "sqrt $ #0" },
             { typeof(Math).GetMethod("Tan", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "tan $ #0" },
-            { typeof(IC10).GetMethod("Yield", BindingFlags.Public | BindingFlags.Static)!, "yield" },
-            { typeof(IC10).GetMethod("Sleep", BindingFlags.Public | BindingFlags.Static, new [] { typeof(float) })!, "sleep #0" },
         };
 
-        public IEnumerable<MethodInfo> MethodDependencies => methodDependencies;
+        public IEnumerable<MethodBase> MethodDependencies => methodDependencies;
 
         public ExecutionContext(RegisterAllocations reservedRegisters, MethodBase method)
         {
@@ -82,7 +79,7 @@ namespace CsToMips.Compiler
             this.reservedRegisters = reservedRegisters;
             this.method = method;
             currentRegisterAllocations = reservedRegisters;
-            methodDependencies = new HashSet<MethodInfo>();
+            methodDependencies = new HashSet<MethodBase>();
             callSites = new List<(int instructionIndex, RegisterAllocations registersInUse, MethodBase method)>();
             var ps = method.GetParameters();
             paramIndexToRegister = new int[ps.Length];
@@ -95,7 +92,7 @@ namespace CsToMips.Compiler
         public void Compile(ReadOnlySpan<Instruction> instructions, OutputWriter outputWriter)
         {
             var preamble = new StringBuilder();
-            for (int i = paramIndexToRegister.Length - 1; i >= 0; --i)
+            for (int i = 0; i < paramIndexToRegister.Length; ++i)
             {
                 preamble.AppendLine($"pop r{paramIndexToRegister[i]}");
             }
@@ -141,6 +138,13 @@ namespace CsToMips.Compiler
             else if (instruction.OpCode == OpCodes.Ldarg_3) { valueStack.Push(new RegisterStackValue { RegisterIndex = paramIndexToRegister[2] }); }
             else if (instruction.OpCode == OpCodes.Ldarg_S) { valueStack.Push(new RegisterStackValue { RegisterIndex = paramIndexToRegister[(sbyte)instruction.Data] }); }
             else throw new InvalidOperationException();
+        }
+
+        [OpCodeHandler(@"ldstr")]
+        private void Handle_Ldstr(ReadOnlySpan<Instruction> instructions, int instructionIndex, OutputWriter outputWriter)
+        {
+            var instruction = instructions[instructionIndex];
+            valueStack.Push(new StringStackValue { Value = (string)instruction.Data });
         }
 
         [OpCodeHandler(@"ldfld")]
@@ -203,34 +207,59 @@ namespace CsToMips.Compiler
                 // This could be a super call on the ctor, for now let's ignore
                 return;
             }
+            var callParams = GetCallParameters(method);
+            var callTarget = method.IsStatic ? null : valueStack.Pop();
+            CompileHintCallType compileHintCallType;
+            string? compileHintPattern;
+            var compileHintAttr = method.GetCustomAttribute<CompileHintAttribute>();
             if (simpleMethodCompilers.TryGetValue(method, out string? pattern))
             {
-                var ps = method.GetParameters();
-                var paramValues = new StackValue[ps.Length];
-                for (int i = 0; i < ps.Length; ++i)
+                compileHintCallType = CompileHintCallType.Inline;
+                compileHintPattern = pattern;
+            }
+            else if (compileHintAttr != null)
+            {
+                compileHintCallType = compileHintAttr.CompileHintCallType;
+                compileHintPattern = compileHintAttr.Pattern;
+            }
+            else
+            {
+                compileHintCallType = CompileHintCallType.Inline;
+                compileHintPattern = null;
+            }
+            if (!string.IsNullOrEmpty(compileHintPattern))
+            {
+                var substitutedPattern = compileHintPattern;
+                
+                if (compileHintCallType == CompileHintCallType.Inline)
                 {
-                    paramValues[i] = valueStack.Pop();
-                    pattern = pattern.Replace($"#{i}", paramValues[i].AsIC10);
+                    for (int i = 0; i < callParams.Length; ++i)
+                    {
+                        substitutedPattern = substitutedPattern.Replace($"#{i}", callParams[i].AsIC10);
+                    }
+                    if (method is MethodInfo methodInfo1 && methodInfo1.ReturnType != typeof(void))
+                    {
+                        int regIdx = AllocateRegister();
+                        var regValue = new RegisterStackValue { RegisterIndex = regIdx };
+                        substitutedPattern = substitutedPattern.Replace("$", regValue.AsIC10);
+                        valueStack.Push(regValue);
+                    }
+                    outputWriter.SetCode(instructionIndex, substitutedPattern);
                 }
-                if (method is MethodInfo methodInfo1 && methodInfo1.ReturnType != typeof(void))
+                else if (compileHintCallType == CompileHintCallType.CallStack)
                 {
-                    int regIdx = AllocateRegister();
-                    var regValue = new RegisterStackValue { RegisterIndex = regIdx };
-                    pattern = pattern.Replace("$", regValue.AsIC10);
-                    valueStack.Push(regValue);
+                    throw new NotImplementedException();
                 }
-                outputWriter.SetCode(instructionIndex, pattern);
-                foreach (var v in paramValues)
+                else
                 {
-                    CheckFree(v);
+                    throw new NotImplementedException();
                 }
+                CheckFree(callParams);
                 return;
             }
-
             if (method.Name.StartsWith("set_"))
             {
-                var valueToWrite = valueStack.Pop();
-                var callTarget = valueStack.Pop();
+                var valueToWrite = callParams[0];
                 if (callTarget is not DeviceStackValue deviceStackValue)
                 {
                     throw new InvalidOperationException($"Can't call methods on unsupported value '${callTarget}'");
@@ -245,12 +274,11 @@ namespace CsToMips.Compiler
                 {
                     outputWriter.SetCode(instructionIndex, $"s {callTarget.AsIC10} {propertyName} {valueToWrite.AsIC10}");
                 }
-                CheckFree(valueToWrite);
+                CheckFree(callParams);
                 return;
             }
             if (method.Name.StartsWith("get_"))
             {
-                var callTarget = valueStack.Pop();
                 if (callTarget is not DeviceStackValue deviceStackValue)
                 {
                     throw new InvalidOperationException($"Can't call methods on unsupported value '${callTarget}'");
@@ -263,53 +291,21 @@ namespace CsToMips.Compiler
                 valueStack.Push(regValue);
                 return;
             }
-            if (method == typeof(IC10).GetMethod("Yield", BindingFlags.Static | BindingFlags.Public))
+            if (method.DeclaringType == typeof(IC10Helpers) && method.Name == "GetTypeHash")
             {
-                outputWriter.SetCode(instructionIndex, $"yield");
-                return;
-            }
-            if (method == typeof(IC10).GetMethod("Sleep", BindingFlags.Static | BindingFlags.Public))
-            {
-                var value = valueStack.Pop();
-                outputWriter.SetCode(instructionIndex, $"sleep {value.AsIC10}");
-                CheckFree(value);
+                var deviceType = method.GetGenericArguments()[0];
+                if (deviceType == null) { throw new InvalidOperationException(); }
+                var deviceInterfaceAttr = deviceType.GetCustomAttribute<DeviceInterfaceAttribute>();
+                if (deviceInterfaceAttr == null) { throw new InvalidOperationException($"GetTypeHash must be called with a valid device interface"); }
+                valueStack.Push(new StaticStackValue { Value = deviceInterfaceAttr.TypeHash });
+                CheckFree(callParams);
                 return;
             }
             if (method is MethodInfo methodInfo)
             {
-                var ps = method.GetParameters();
-                var paramValues = new StackValue[ps.Length];
-                for (int i = 0; i < ps.Length; ++i)
+                if (callTarget is ThisStackValue || callTarget == null)
                 {
-                    paramValues[i] = valueStack.Pop();
-                }
-                var callTarget = method.IsStatic ? null : valueStack.Pop();
-                if (callTarget is ThisStackValue)
-                {
-                    methodDependencies.Add(methodInfo);
-                    var sb = new StringBuilder();
-                    sb.AppendLine("# CALLSITE ENTRY");
-                    sb.AppendLine("push ra");
-                    for (int i = 0; i < ps.Length; ++i)
-                    {
-                        sb.AppendLine($"push {paramValues[i].AsIC10}");
-                    }
-                    sb.AppendLine($"jal {method.Name}");
-                    for (int i = 0; i < ps.Length; ++i)
-                    {
-                        CheckFree(paramValues[i]);
-                    }
-                    callSites.Add((instructionIndex, currentRegisterAllocations, method));
-                    if (methodInfo.ReturnParameter.ParameterType != typeof(void))
-                    {
-                        var regIdx = AllocateRegister();
-                        var regValue = new RegisterStackValue { RegisterIndex = regIdx };
-                        sb.AppendLine($"pop {regValue.AsIC10}");
-                        valueStack.Push(regValue);
-                    }
-                    sb.AppendLine("pop ra");
-                    sb.AppendLine("# CALLSITE EXIT");
-                    outputWriter.SetCode(instructionIndex, sb.ToString().Trim());
+                    GenerateCallSite(callParams, method, instructionIndex, outputWriter);
                     return;
                 }
                 else if (callTarget is DeviceStackValue deviceStackValue && methodInfo.Name.StartsWith("Get"))
@@ -319,18 +315,40 @@ namespace CsToMips.Compiler
                     var regIdx = AllocateRegister();
                     var regValue = new RegisterStackValue { RegisterIndex = regIdx };
                     int typeHash = deviceStackValue.DeviceType.GetCustomAttribute<DeviceInterfaceAttribute>()?.TypeHash ?? 0;
-                    outputWriter.SetCode(instructionIndex, $"lb {regValue.AsIC10} {typeHash} {callTarget.AsIC10} {propertyName} {paramValues[0].AsIC10}");
+                    outputWriter.SetCode(instructionIndex, $"lb {regValue.AsIC10} {typeHash} {callTarget.AsIC10} {propertyName} {callParams[0].AsIC10}");
                     valueStack.Push(regValue);
-                    for (int i = 0; i < ps.Length; ++i)
-                    {
-                        CheckFree(paramValues[i]);
-                    }
+                    CheckFree(callParams);
                     return;
                 }
                 throw new InvalidOperationException($"Can't call unsupported method '{method}'");
             }
 
             throw new InvalidOperationException($"Can't call unsupported method '{method}'");
+        }
+
+        private void GenerateCallSite(StackValue[] callParams, MethodBase method, int instructionIndex, OutputWriter outputWriter)
+        {
+            methodDependencies.Add(method);
+            var sb = new StringBuilder();
+            sb.AppendLine("# CALLSITE ENTRY");
+            sb.AppendLine("push ra");
+            for (int i = 0; i < callParams.Length; ++i)
+            {
+                sb.AppendLine($"push {callParams[i].AsIC10}");
+            }
+            sb.AppendLine($"jal {method.Name}");
+            CheckFree(callParams);
+            callSites.Add((instructionIndex, currentRegisterAllocations, method));
+            if (method is MethodInfo methodInfo && methodInfo.ReturnType != typeof(void))
+            {
+                var regIdx = AllocateRegister();
+                var regValue = new RegisterStackValue { RegisterIndex = regIdx };
+                sb.AppendLine($"pop {regValue.AsIC10}");
+                valueStack.Push(regValue);
+            }
+            sb.AppendLine("pop ra");
+            sb.AppendLine("# CALLSITE EXIT");
+            outputWriter.SetCode(instructionIndex, sb.ToString().Trim());
         }
 
         [OpCodeHandler(@"b(r|eq|ge|gt|le|lt|ne|rfalse|rtrue|rzero)(\.un)?(\.s)?")]
@@ -593,6 +611,17 @@ namespace CsToMips.Compiler
             }
         }
 
+        private StackValue[] GetCallParameters(MethodBase method)
+        {
+            var ps = method.GetParameters();
+            var paramValues = new StackValue[ps.Length];
+            for (int i = 0; i < ps.Length; ++i)
+            {
+                paramValues[ps.Length - (i + 1)] = valueStack.Pop();
+            }
+            return paramValues;
+        }
+
         private int AllocateRegister()
         {
             currentRegisterAllocations = currentRegisterAllocations.Allocate(out int regIdx);
@@ -606,6 +635,14 @@ namespace CsToMips.Compiler
             int refCount = FindRegisterReferences(registerStackValue.RegisterIndex);
             if (refCount > 0) { return; }
             currentRegisterAllocations = currentRegisterAllocations.Free(registerStackValue.RegisterIndex);
+        }
+
+        private void CheckFree(IEnumerable<StackValue> stackValues)
+        {
+            foreach (var stackValue in stackValues)
+            {
+                CheckFree(stackValue);
+            }
         }
 
         private int FindRegisterReferences(int registerIndex)

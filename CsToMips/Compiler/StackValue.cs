@@ -43,4 +43,11 @@ namespace CsToMips.Compiler
 
         public override string AsIC10 { get => AliasName; }
     }
+
+    internal class StringStackValue : StackValue
+    {
+        public string Value { get; set; } = "";
+
+        public override string AsIC10 { get => Value; }
+    }
 }

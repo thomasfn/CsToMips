@@ -20,7 +20,7 @@
             {
                 SolarPanels.Horizontal = DaylightSensor.Horizontal + 180.0f;
                 SolarPanels.Vertical = DaylightSensor.Vertical / 2.0f;
-                IC10.Yield();
+                IC10Helpers.Yield();
             }
         }
     }

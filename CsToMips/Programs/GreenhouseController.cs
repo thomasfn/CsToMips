@@ -41,7 +41,7 @@
             {
                 CheckTemps();
                 CheckGrowLights();
-                IC10.Yield();
+                IC10Helpers.Yield();
             }
         }
 

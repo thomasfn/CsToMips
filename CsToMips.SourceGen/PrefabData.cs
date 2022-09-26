@@ -28,6 +28,9 @@ namespace CsToMips.SourceGen
     {
         [JsonPropertyName("logicTypes")]
         public IEnumerable<LogicType> LogicTypes { get; set; } = Enumerable.Empty<LogicType>();
+
+        [JsonPropertyName("logicSlotTypes")]
+        public IEnumerable<LogicSlotType> LogicSlotTypes { get; set; } = Enumerable.Empty<LogicSlotType>();
     }
 
     public class LogicType
@@ -40,6 +43,24 @@ namespace CsToMips.SourceGen
 
         [JsonPropertyName("canWrite")]
         public bool CanWrite { get; set; }
+    }
+
+    public class LogicSlotType
+    {
+        [JsonPropertyName("logicSlotType")]
+        public string Type { get; set; } = "";
+
+        [JsonPropertyName("slots")]
+        public IEnumerable<LogicSlot> Slots { get; set; } = Enumerable.Empty<LogicSlot>();
+    }
+
+    public class LogicSlot
+    {
+        [JsonPropertyName("slotIndex")]
+        public int SlotIndex { get; set; }
+
+        [JsonPropertyName("canRead")]
+        public bool CanRead { get; set; }
     }
 
     public class PrefabData

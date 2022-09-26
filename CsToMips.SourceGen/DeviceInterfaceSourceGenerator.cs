@@ -16,10 +16,18 @@ namespace CsToMips.SourceGen
         private static readonly IReadOnlyDictionary<string, string> overrideLogicTypes = new Dictionary<string, string>
         {
             { "On", "bool" },
+            { "Open", "bool" },
             { "Error", "bool" },
             { "Lock", "bool" },
             { "Activate", "bool" },
+            { "Occupied", "bool" },
+            { "ClearMemory", "bool" },
             { "PrefabHash", "int" },
+            { "OccupantHash", "int" },
+            { "Quantity", "int" },
+            { "MaxQuantity", "int" },
+            { "InputCount", "int" },
+            { "OutputCount", "int" },
             { "Mode", "int" },
         };
 
@@ -32,6 +40,7 @@ namespace CsToMips.SourceGen
         {
             IEnumerable<AdditionalText> files = context.AdditionalFiles.Where(at => at.Path.EndsWith("PrefabData.json"));
             var sourceBuilder = new StringBuilder();
+            sourceBuilder.AppendLine($"using System;");
             sourceBuilder.AppendLine($"namespace CsToMips.Devices");
             sourceBuilder.AppendLine($"{{");
             foreach (var file in files)
@@ -62,6 +71,15 @@ namespace CsToMips.SourceGen
         private string GetLogicTypeClrType(LogicType logicType)
         {
             if (overrideLogicTypes.TryGetValue(logicType.Type, out var overrideType))
+            {
+                return overrideType;
+            }
+            return "float";
+        }
+
+        private string GetLogicTypeClrType(LogicSlotType logicSlotType)
+        {
+            if (overrideLogicTypes.TryGetValue(logicSlotType.Type, out var overrideType))
             {
                 return overrideType;
             }
@@ -104,6 +122,18 @@ namespace CsToMips.SourceGen
                 }
                 sb.AppendLine($"{prefix}}}");
             }
+            if (thing.Logic.LogicSlotTypes.Any())
+            {
+                sb.AppendLine($"{prefix}public interface I{thing.PrefabName}Slot");
+                sb.AppendLine($"{prefix}{{");
+                foreach (var logicSlotType in thing.Logic.LogicSlotTypes)
+                {
+                    var clrType = GetLogicTypeClrType(logicSlotType);
+                    sb.AppendLine($"{prefix}{INDENT}{clrType} {logicSlotType.Type} {{ get; }}");
+                }
+                sb.AppendLine($"{prefix}}}");
+
+            }
             sb.AppendLine($"{prefix}[DeviceInterface({thing.PrefabHash})]");
             sb.AppendLine($"{prefix}public interface I{thing.PrefabName}");
             sb.AppendLine($"{prefix}{{");
@@ -117,7 +147,14 @@ namespace CsToMips.SourceGen
                 if (logicType.CanWrite) { sb.Append(" set;"); }
                 sb.AppendLine(" }");
             }
-            sb.AppendLine($"{prefix}{INDENT}");
+            if (thing.Logic.LogicSlotTypes.Any())
+            {
+                int slotCount = thing.Logic.LogicSlotTypes
+                    .Select(lst => lst.Slots.Count())
+                    .Max();
+                sb.AppendLine($"{prefix}{INDENT}[DeviceSlotCount({slotCount})]");
+                sb.AppendLine($"{prefix}{INDENT}ReadOnlySpan<I{thing.PrefabName}Slot> Slots {{ get; }}");
+            }
             sb.AppendLine($"{prefix}}}");
             sb.AppendLine($"{prefix}[DeviceInterface({thing.PrefabHash})]");
             sb.AppendLine($"{prefix}public interface IMulticast{thing.PrefabName}");

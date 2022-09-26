@@ -8,10 +8,6 @@
   </PropertyGroup>	
 	
   <ItemGroup>
-    <Folder Include="Programs\Components\" />
-  </ItemGroup>	
-	
-  <ItemGroup>
     <ProjectReference Include="..\CsToMips.Api\CsToMips.Api.csproj" />
     <ProjectReference Include="..\CsToMips.Compiler\CsToMips.Compiler.csproj" />
   </ItemGroup>

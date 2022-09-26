@@ -14,7 +14,7 @@ namespace CsToMips
                 .ToArray();
             foreach (var program in programs)
             {
-                var compiler = new Compiler.Compiler(program);
+                var compiler = new Compiler.Compiler(program, Compiler.CompilerOptions.Default);
                 var ic10 = compiler.Compile();
                 var filename = $"{program.Name}.ic10";
                 File.WriteAllText(filename, ic10);

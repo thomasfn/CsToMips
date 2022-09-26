@@ -3,17 +3,32 @@ using System.Text;
 
 namespace CsToMips.Compiler
 {
+    public readonly struct CompilerOptions
+    {
+        public readonly bool ShouldOptimise;
+        public readonly bool AllowInlining;
+
+        public static readonly CompilerOptions Default = new CompilerOptions(true, true);
+
+        public CompilerOptions(bool shouldOptimise, bool allowInlining)
+        {
+            ShouldOptimise = shouldOptimise;
+            AllowInlining = allowInlining;
+        }
+    }
+
     public class Compiler
     {
         private readonly Type programType;
+        private readonly CompilerOptions options;
         private readonly StringBuilder ic10Stream;
 
-        public Compiler(Type programType)
+        public Compiler(Type programType, CompilerOptions options)
         {
             if (!typeof(IStationeersProgram).IsAssignableFrom(programType)) { throw new ArgumentException($"Program must implement IStationeersProgram", nameof(programType)); }
             this.programType = programType;
+            this.options = options;
             ic10Stream = new StringBuilder();
-
         }
 
         public string Compile()
@@ -65,7 +80,7 @@ namespace CsToMips.Compiler
             }
             ic10Stream.AppendLine("end:");
             var ic10 = ic10Stream.ToString();
-            return new Optimiser().Optimise(ic10);
+            return options.ShouldOptimise ? new Optimiser().Optimise(ic10) : ic10;
         }
 
         private void CompileMethod(string? methodName, MethodBase method, RegisterAllocations reservedRegisters, IDictionary<MethodBase, (ExecutionContext, OutputWriter)> methodContextMap)
@@ -73,7 +88,7 @@ namespace CsToMips.Compiler
             var instructions = ILView.ToOpCodes(method).ToArray();
             var outputWriter = new OutputWriter(instructions.Length);
             outputWriter.LabelPrefix = methodName ?? "";
-            var context = new ExecutionContext(reservedRegisters, method, false);
+            var context = new ExecutionContext(options, reservedRegisters, method, false);
             methodContextMap.Add(method, (context, outputWriter));
             context.Compile(instructions, outputWriter);
             foreach (var depMethod in context.MethodDependencies)

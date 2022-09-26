@@ -50,4 +50,29 @@ namespace CsToMips.Compiler
 
         public override string AsIC10 { get => Value; }
     }
+
+    internal class NullStackValue : StackValue
+    {
+        public override string AsIC10 { get { throw new InvalidOperationException(); } }
+    }
+
+    internal class DeviceSlotsStackValue : StackValue
+    {
+        public string PinName { get; set; } = "";
+
+        public Type DeviceType { get; set; } = null!;
+
+        public override string AsIC10 { get { throw new InvalidOperationException(); } }
+    }
+
+    internal class DeviceSlotStackValue : StackValue
+    {
+        public string PinName { get; set; } = "";
+
+        public Type DeviceType { get; set; } = null!;
+
+        public StackValue SlotIndex { get; set; } = null!;
+
+        public override string AsIC10 { get { throw new InvalidOperationException(); } }
+    }
 }

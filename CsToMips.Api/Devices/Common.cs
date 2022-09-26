@@ -9,7 +9,18 @@ namespace CsToMips.Devices
 
         public DeviceInterfaceAttribute(int typeHash)
         {
-            this.TypeHash = typeHash;
+            TypeHash = typeHash;
+        }
+    }
+
+    [AttributeUsage(AttributeTargets.Property, Inherited = false, AllowMultiple = true)]
+    public sealed class DeviceSlotCountAttribute : Attribute
+    {
+        public readonly int SlotCount;
+
+        public DeviceSlotCountAttribute(int slotCount)
+        {
+            SlotCount = slotCount;
         }
     }
 

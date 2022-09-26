@@ -170,17 +170,16 @@ namespace CsToMips.Compiler
                             data = reader.ReadSByte();
                             break;
                         case OperandType.InlineVar:
-                            reader.ReadUInt16();
+                            data = reader.ReadUInt16();
                             break;
                         case OperandType.InlineSig:
                         case OperandType.InlineType:
-                            reader.ReadUInt32();
+                            data = reader.ReadUInt32();
                             break;
                         case OperandType.InlineNone:
                             break;
                         case OperandType.InlineBrTarget:
-                            // data = 
-                            reader.ReadUInt32();
+                            data = reader.ReadInt32();
                             break;
                         case OperandType.InlineSwitch:
                             {

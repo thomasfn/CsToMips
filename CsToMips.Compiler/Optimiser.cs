@@ -89,6 +89,7 @@ namespace CsToMips.Compiler
                 changesMade |= Optimise_ChainJumps(instructions);
                 changesMade |= Optimise_UnusedLabels(instructions);
                 changesMade |= Optimise_UnreachableCode(instructions);
+                changesMade |= Optimise_RedundantMoves(instructions);
             }
             while (changesMade);
         }
@@ -215,6 +216,57 @@ namespace CsToMips.Compiler
                         changesMade |= true;
                     }
                 }
+            }
+            return changesMade;
+        }
+
+        private bool Optimise_RedundantMoves(IList<IC10Instruction> instructions)
+        {
+            bool changesMade = false;
+            Span<float?> knownRegisterValues = stackalloc float?[RegisterAllocations.NumTotal];
+            Span<int?> lastWrite = stackalloc int?[RegisterAllocations.NumTotal];
+            Span<int?> lastRead = stackalloc int?[RegisterAllocations.NumTotal];
+            for (int i = 0; i < instructions.Count; ++i)
+            {
+                var instruction = instructions[i];
+                if (instruction.Kind == IC10InstructionKind.Instruction && instruction.OpCode == "move")
+                {
+                    if (instruction.Operands[0] == instruction.Operands[1])
+                    {
+                        // e.g. "move r1 r1"
+                        instructions.RemoveAt(i);
+                        changesMade |= true;
+                        --i;
+                        continue;
+                    }
+                    if (int.TryParse(instruction.Operands[0][1..], out int regIdx))
+                    {
+                        if (float.TryParse(instruction.Operands[1], out float staticValue))
+                        {
+                            knownRegisterValues[regIdx] = staticValue;
+                        }
+                        else
+                        {
+                            knownRegisterValues[regIdx] = null;
+                        }
+                        lastWrite[regIdx] = i;
+                    }
+                    else
+                    {
+                        // Could be a label or indirection, assume the worst
+                        knownRegisterValues.Fill(null);
+                    }
+                    continue;
+                }
+                // If a jump lands here, we can't know what happened to the registers before the jump, so assume the worst
+                if (instruction.Kind == IC10InstructionKind.Label)
+                {
+                    knownRegisterValues.Fill(null);
+                    continue;
+                }
+                // TODO: realisticly this is going to be too complex to implement without flow analysis or better instruction metadata
+                // So let's leave this half-implemented for now and come back to this later
+
             }
             return changesMade;
         }

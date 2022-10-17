@@ -86,6 +86,8 @@ namespace CsToMips.Compiler
             { typeof(Math).GetMethod("Sin", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "sin $ #0" },
             { typeof(Math).GetMethod("Sqrt", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "sqrt $ #0" },
             { typeof(Math).GetMethod("Tan", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "tan $ #0" },
+            { typeof(Math).GetMethod("Clamp", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double), typeof(double), typeof(double) })!, "max %1 #1 #0\nmin $ #2 %1" },
+            { typeof(Math).GetMethod("Clamp", BindingFlags.Public | BindingFlags.Static, new [] { typeof(float), typeof(float), typeof(float) })!, "max %1 #1 #0\nmin $ #2 %1" },
         };
 
         public IEnumerable<MethodBase> MethodDependencies => methodDependencies;
@@ -108,7 +110,7 @@ namespace CsToMips.Compiler
             methodDependencies = new HashSet<MethodBase>();
             callSites = new List<CallSite>();
             var ps = method.GetParameters();
-            paramIndexToStackValue = new RegisterStackValue[ps.Length];
+            paramIndexToStackValue = new StackValue[ps.Length];
             if (isInline)
             {
                 for (int i = 0; i < ps.Length; ++i)
@@ -346,12 +348,27 @@ namespace CsToMips.Compiler
                     {
                         substitutedPattern = substitutedPattern.Replace($"#{i}", callParams[i].AsIC10);
                     }
+                    var tempRegisterMap = new int?[RegisterAllocations.NumTotal];
+                    substitutedPattern = new Regex(@"%[0-9]{1,2}").Replace(substitutedPattern, (match) =>
+                    {
+                        var tempRegisterIdx = int.Parse(match.Value[1..]);
+                        if (tempRegisterMap[tempRegisterIdx] == null)
+                        {
+                            tempRegisterMap[tempRegisterIdx] = AllocateRegister();
+                        }
+                        return $"r{tempRegisterMap[tempRegisterIdx]}";
+                    });
                     if (method is MethodInfo methodInfo1 && methodInfo1.ReturnType != typeof(void))
                     {
                         int regIdx = AllocateRegister();
                         var regValue = new RegisterStackValue { RegisterIndex = regIdx };
                         substitutedPattern = substitutedPattern.Replace("$", regValue.AsIC10);
                         valueStack.Push(regValue);
+                    }
+                    foreach (var tempReg in tempRegisterMap)
+                    {
+                        if (tempReg == null) { continue; }
+                        CheckFree(new RegisterStackValue { RegisterIndex = tempReg.Value });
                     }
                     outputWriter.SetCode(instructionIndex, substitutedPattern);
                 }
@@ -610,6 +627,20 @@ namespace CsToMips.Compiler
             var instruction = instructions[instructionIndex];
             var rhs = valueStack.Pop();
             var lhs = valueStack.Pop();
+            if (lhs is StaticStackValue lhsStatic && rhs is StaticStackValue rhsStatic)
+            {
+                float result;
+                if (instruction.OpCode == OpCodes.Add) { result = lhsStatic.Value + rhsStatic.Value; }
+                else if (instruction.OpCode == OpCodes.Sub) { result = lhsStatic.Value - rhsStatic.Value; }
+                else if (instruction.OpCode == OpCodes.Mul) { result = lhsStatic.Value * rhsStatic.Value; }
+                else if (instruction.OpCode == OpCodes.Div) { result = lhsStatic.Value / rhsStatic.Value; }
+                else if (instruction.OpCode == OpCodes.And) { result = (lhsStatic.Value != 0.0f && rhsStatic.Value != 0.0f) ? 1.0f : 0.0f; }
+                else if (instruction.OpCode == OpCodes.Or) { result = (lhsStatic.Value != 0.0f || rhsStatic.Value != 0.0f) ? 1.0f : 0.0f; }
+                else if (instruction.OpCode == OpCodes.Xor) { result = (int)lhsStatic.Value ^ (int)rhsStatic.Value; }
+                else { throw new InvalidOperationException(); }
+                valueStack.Push(new StaticStackValue { Value = result });
+                return;
+            }
             string ic10;
             if (instruction.OpCode == OpCodes.Add) { ic10 = "add"; }
             else if (instruction.OpCode == OpCodes.Sub) { ic10 = "sub"; }
@@ -634,6 +665,14 @@ namespace CsToMips.Compiler
             else { throw new InvalidOperationException(); }
             EmitWriteInstruction($"{ic10} $ {rhs.AsIC10}", instructions, ref instructionIndex, outputWriter);
             CheckFree(rhs);
+        }
+
+        [OpCodeHandler(@"neg")]
+        private void Handle_Neg(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        {
+            var value = valueStack.Pop();
+            EmitWriteInstruction($"sub $ 0 {value.AsIC10}", instructions, ref instructionIndex, outputWriter);
+            CheckFree(value);
         }
 
         [OpCodeHandler(@"(ceq|cgt|clt)(\.un)?")]
@@ -794,19 +833,19 @@ namespace CsToMips.Compiler
             foreach (var callSite in callSites)
             {
                 var (methodContext, methodOutputWriter) = contexts[callSite.TargetMethod];
-                FixupCallSite(callSite, methodContext, methodOutputWriter, outputWriter);
+                FixupCallSite(contexts, callSite, methodContext, methodOutputWriter, outputWriter);
             }
         }
 
-        private void FixupCallSite(in CallSite callSite, ExecutionContext methodContext, OutputWriter methodOutputWriter, OutputWriter outputWriter)
+        private void FixupCallSite(IReadOnlyDictionary<MethodBase, (ExecutionContext, OutputWriter)> contexts, in CallSite callSite, ExecutionContext methodContext, OutputWriter methodOutputWriter, OutputWriter outputWriter)
         {
             if (ShouldInline(callSite, methodContext, methodOutputWriter))
             {
-                GenerateInlineCall(callSite, methodContext, outputWriter);
+                GenerateInlineCall(contexts, callSite, methodContext, outputWriter);
             }
             else
             {
-                GenerateCallStackCall(callSite, methodContext, outputWriter);
+                GenerateCallStackCall(contexts, callSite, methodContext, outputWriter);
             }
         }
 
@@ -818,11 +857,11 @@ namespace CsToMips.Compiler
             int callStackInstructionCount = EstimateCallStackCallInstructionCount(callSite, methodContext);
             var inlineInstructionCount = methodOutputWriter.ToString().Split(Environment.NewLine).Length - 1;
             // TODO: If there's only a single call ever to the target method, inlining would always result in less instructions, so discard this check
-            if (inlineInstructionCount > callStackInstructionCount) { return false; }
+            //if (inlineInstructionCount > callStackInstructionCount) { return false; }
             return true;
         }
 
-        private void GenerateCallStackCall(in CallSite callSite, ExecutionContext methodContext, OutputWriter outputWriter)
+        private void GenerateCallStackCall(IReadOnlyDictionary<MethodBase, (ExecutionContext, OutputWriter)> contexts, in CallSite callSite, ExecutionContext methodContext, OutputWriter outputWriter)
         {
             var conflictingRegisters = methodContext.allUsedRegisters & callSite.RegistersState & ~reservedRegisters;
             var sb = new StringBuilder();
@@ -856,16 +895,17 @@ namespace CsToMips.Compiler
             return conflictingRegisters.NumAllocated + callSite.CallParams.Length + 3;
         }
 
-        private void GenerateInlineCall(in CallSite callSite, ExecutionContext methodContext, OutputWriter outputWriter)
+        private void GenerateInlineCall(IReadOnlyDictionary<MethodBase, (ExecutionContext, OutputWriter)> contexts, in CallSite callSite, ExecutionContext methodContext, OutputWriter outputWriter)
         {
             // We can't rely on precompiled method code as it's designed to be called via the call stack, so recompile it inline
             var registers = reservedRegisters | callSite.RegistersState;
             if (callSite.ReturnParam is RegisterStackValue registerStackValue) { registers.Allocate(registerStackValue.RegisterIndex); }
-            var inlineContext = new ExecutionContext(compilerOptions, registers, callSite.TargetMethod, true, callSite.CallParams, callSite.ReturnParam);
+            var inlineContext = new ExecutionContext(compilerOptions, registers, callSite.TargetMethod, true, callSite.CallParams.Reverse(), callSite.ReturnParam);
             var instructions = ILView.ToOpCodes(callSite.TargetMethod).ToArray();
             var inlineOutputWriter = new OutputWriter(instructions.Length);
             inlineOutputWriter.LabelPrefix = $"{outputWriter.GetLabel(callSite.InstructionIndex)}_inl";
             inlineContext.Compile(instructions, inlineOutputWriter);
+            inlineContext.FixupCallSites(contexts, inlineOutputWriter);
             outputWriter.SetCode(callSite.InstructionIndex, inlineOutputWriter.ToString().Trim());
         }
 

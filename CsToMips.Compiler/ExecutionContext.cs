@@ -2,6 +2,7 @@
 using System.Reflection.Emit;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Collections.Immutable;
 
 namespace CsToMips.Compiler
 {
@@ -30,44 +31,104 @@ namespace CsToMips.Compiler
         }
     }
 
-    internal delegate void InstructionHandler(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter);
+    internal struct ExecutionState
+    {
+        public VirtualStack VirtualStack;
+        public RegisterAllocations RegisterAllocations;
+        public ImmutableArray<CallSite> CallSites;
+        public ImmutableArray<int> LocalVariableRegisterMappings;
+        public ImmutableArray<StackValue?> LocalVariableKnownStates;
+        public ImmutableArray<FragmentText> PendingIntermediateFragments;
+    }
+
+    internal readonly struct CallBinding
+    {
+        public readonly MethodBase TargetMethod;
+        public readonly StackValue[] CallParams;
+        public readonly StackValue? ReturnParam;
+        public readonly RegisterAllocations PreRegisterAllocations;
+
+        public CallBinding(MethodBase targetMethod, StackValue[] callParams, StackValue? returnParam, RegisterAllocations preRegisterAllocations)
+        {
+            TargetMethod = targetMethod;
+            CallParams = callParams;
+            ReturnParam = returnParam;
+            PreRegisterAllocations = preRegisterAllocations;
+        }
+    }
 
     internal readonly struct CallSite
     {
         public readonly int InstructionIndex;
-        public readonly MethodBase TargetMethod;
-        public readonly StackValue[] CallParams;
-        public readonly StackValue? ReturnParam;
+        public readonly CallBinding Binding;
         public readonly RegisterAllocations RegistersState;
-        public readonly StackValue[] ValueStackState;
+        public readonly VirtualStack StackState;
 
-        public CallSite(int instructionIndex, MethodBase targetMethod, StackValue[] callParams, StackValue? returnParam, RegisterAllocations registersState, StackValue[] valueStackState)
+        public CallSite(int instructionIndex, CallBinding binding, RegisterAllocations registersState, VirtualStack stackState)
         {
             InstructionIndex = instructionIndex;
-            TargetMethod = targetMethod;
-            CallParams = callParams;
-            ReturnParam = returnParam;
+            Binding = binding;
             RegistersState = registersState;
-            ValueStackState = valueStackState;
+            StackState = stackState;
         }
     }
+
+    internal readonly struct FragmentText
+    {
+        public readonly string Code;
+        public readonly CallBinding? CallBinding;
+        public readonly ImmutableArray<int> BranchTargets;
+
+        public FragmentText(string code, CallBinding? callBinding = null, ImmutableArray<int>? branchTargets = null)
+        {
+            Code = code;
+            CallBinding = callBinding;
+            BranchTargets = branchTargets ?? ImmutableArray<int>.Empty;
+        }
+
+        public static readonly FragmentText Empty = new(string.Empty, null, null);
+
+        public FragmentText Replace(string oldValue, string newValue)
+            => new FragmentText(Code.Replace(oldValue, newValue), CallBinding, BranchTargets);
+
+        public static FragmentText operator +(in FragmentText lhs, in FragmentText rhs)
+            => new FragmentText($"{lhs.Code}{Environment.NewLine}{rhs.Code}".Trim(), lhs.CallBinding ?? rhs.CallBinding, lhs.BranchTargets.AddRange(rhs.BranchTargets));
+    }
+
+    internal readonly struct Fragment
+    {
+        public readonly int SourceInstructionIndex;
+        public readonly ExecutionState PreExecutionState;
+        public readonly ExecutionState PostExecutionState;
+        public readonly FragmentText Text;
+
+        public Fragment(int sourceInstructionIndex, ExecutionState preExecutionState, ExecutionState postExecutionState, FragmentText text)
+        {
+            SourceInstructionIndex = sourceInstructionIndex;
+            PreExecutionState = preExecutionState;
+            PostExecutionState = postExecutionState;
+            Text = text;
+        }
+    }
+
+    internal delegate FragmentText InstructionHandler(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState);
 
     internal class ExecutionContext
     {
         private readonly IEnumerable<InstructionHandlerDefinition> instructionHandlers;
-        private readonly Stack<StackValue> valueStack;
-        private readonly int[] localVariableRegisters;
-        private readonly StackValue?[] localVariableKnownStates;
-        private RegisterAllocations currentRegisterAllocations;
-        private RegisterAllocations allUsedRegisters;
+        
+        private readonly ExecutionState initialExecutionState;
         private readonly CompilerOptions compilerOptions;
         private readonly RegisterAllocations reservedRegisters;
         private readonly MethodBase method;
         private readonly ISet<MethodBase> methodDependencies;
-        private readonly IList<CallSite> callSites;
         private readonly StackValue[] paramIndexToStackValue;
         private readonly StackValue? returnStackValue;
         private readonly bool isInline;
+        private string localLabelPrefix = string.Empty;
+        private readonly IList<CallSite> allCallSites;
+
+        private RegisterAllocations allUsedRegisters;
 
         private static readonly IReadOnlyDictionary<MethodBase, string> simpleMethodCompilers = new Dictionary<MethodBase, string>
         {
@@ -100,34 +161,33 @@ namespace CsToMips.Compiler
                 .Where(t => t.Item2 != null)
                 .Select(t => new InstructionHandlerDefinition(t.Item2.OpCodeNameMatcher, t.m.CreateDelegate<InstructionHandler>(this)))
                 .ToArray();
-            valueStack = new Stack<StackValue>(initialStackState ?? Enumerable.Empty<StackValue>());
+            initialExecutionState.VirtualStack = VirtualStack.FromEnumerable(initialStackState ?? Enumerable.Empty<StackValue>());
             var methodBody = method.GetMethodBody();
             if (methodBody == null) { throw new InvalidOperationException(); }
             this.compilerOptions = compilerOptions;
             this.reservedRegisters = reservedRegisters;
             this.method = method;
-            currentRegisterAllocations = reservedRegisters;
+            initialExecutionState.RegisterAllocations = reservedRegisters;
             methodDependencies = new HashSet<MethodBase>();
-            callSites = new List<CallSite>();
             var ps = method.GetParameters();
             paramIndexToStackValue = new StackValue[ps.Length];
             if (isInline)
             {
                 for (int i = 0; i < ps.Length; ++i)
                 {
-                    paramIndexToStackValue[i] = valueStack.Pop();
-                    if (paramIndexToStackValue[i] is RegisterStackValue registerStackValue) { currentRegisterAllocations = currentRegisterAllocations.Allocate(registerStackValue.RegisterIndex); }
+                    initialExecutionState.VirtualStack = initialExecutionState.VirtualStack.Pop(out paramIndexToStackValue[i]);
+                    if (paramIndexToStackValue[i] is RegisterStackValue registerStackValue) { initialExecutionState.RegisterAllocations = initialExecutionState.RegisterAllocations.Allocate(registerStackValue.RegisterIndex); }
                 }
             }
             else
             {
                 for (int i = 0; i < ps.Length; ++i)
                 {
-                    paramIndexToStackValue[i] = new RegisterStackValue { RegisterIndex = AllocateRegister() };
+                    paramIndexToStackValue[i] = new RegisterStackValue { RegisterIndex = AllocateRegister(ref initialExecutionState) };
                 }
             }
-            localVariableRegisters = new int[methodBody.LocalVariables.Count];
-            localVariableKnownStates = new StackValue?[methodBody.LocalVariables.Count];
+            var localVariableRegisters = new int[methodBody.LocalVariables.Count];
+            var localVariableKnownStates = new StackValue?[methodBody.LocalVariables.Count];
             for (int i = 0; i < localVariableRegisters.Length; ++i)
             {
                 int width = GetTypeWidth(methodBody.LocalVariables[i].LocalType);
@@ -137,10 +197,14 @@ namespace CsToMips.Compiler
                     continue;
                 }
                 if (width > 1) { throw new NotImplementedException(); }
-                localVariableRegisters[i] = AllocateRegister();
+                localVariableRegisters[i] = AllocateRegister(ref initialExecutionState);
             }
+            initialExecutionState.LocalVariableRegisterMappings = localVariableRegisters.ToImmutableArray();
+            initialExecutionState.LocalVariableKnownStates = localVariableKnownStates.ToImmutableArray();
+            initialExecutionState.PendingIntermediateFragments = ImmutableArray<FragmentText>.Empty;
             this.isInline = isInline;
             this.returnStackValue = returnStackValue;
+            allCallSites = new List<CallSite>();
         }
 
         private static int GetTypeWidth(Type t)
@@ -153,6 +217,7 @@ namespace CsToMips.Compiler
 
         public void Compile(ReadOnlySpan<Instruction> instructions, OutputWriter outputWriter)
         {
+            localLabelPrefix = outputWriter.LabelPrefix;
             var preamble = new StringBuilder();
             if (isInline)
             {
@@ -176,95 +241,124 @@ namespace CsToMips.Compiler
                 }
             }
             outputWriter.Preamble = preamble.ToString().Trim();
+            var executionState = initialExecutionState;
             for (int i = 0; i < instructions.Length; ++i)
             {
-                if (ProcessInstruction(instructions, ref i, outputWriter) == 0)
+                var fragment = ProcessInstruction(instructions, i, executionState);
+                if (fragment == null)
                 {
                     throw new InvalidOperationException($"Unhandled instruction {instructions[i]}");
+                }
+                outputWriter.SetCode(i, fragment.Value.Text.Code);
+                executionState = fragment.Value.PostExecutionState;
+                foreach (var branchTarget in fragment.Value.Text.BranchTargets)
+                {
+                    outputWriter.SetWithLabel(branchTarget, true);
+                }
+                if (fragment.Value.Text.CallBinding != null)
+                {
+                    allCallSites.Add(new CallSite(i, fragment.Value.Text.CallBinding.Value, fragment.Value.PreExecutionState.RegisterAllocations, fragment.Value.PreExecutionState.VirtualStack));
                 }
             }
         }
 
-        private int ProcessInstruction(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private Fragment? ProcessInstruction(ReadOnlySpan<Instruction> instructions, int instructionIndex, in ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            int numHandlers = 0;
             foreach (var handlerDefinition in instructionHandlers)
             {
                 if (handlerDefinition.OpCodeNameMatcher.IsMatch(instruction.OpCode.Name ?? ""))
                 {
-                    handlerDefinition.Handler(instructions, ref instructionIndex, outputWriter);
-                    ++numHandlers;
+                    var postExecutionState = executionState;
+                    var fragmentText = handlerDefinition.Handler(instructions, instructionIndex, ref postExecutionState);
+                    FragmentText preFragmentText = FragmentText.Empty;
+                    foreach (var intermediateFragment in postExecutionState.PendingIntermediateFragments)
+                    {
+                        preFragmentText += intermediateFragment;
+                    }
+                    postExecutionState.PendingIntermediateFragments = ImmutableArray<FragmentText>.Empty;
+                    return new Fragment(instructionIndex, executionState, postExecutionState, preFragmentText + fragmentText);
                 }
             }
-            return numHandlers;
+            return null;
         }
 
         [OpCodeHandler(@"nop")]
-        private void Handle_Noop(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter) { }
+        private FragmentText Handle_Noop(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+            => FragmentText.Empty;
 
         [OpCodeHandler(@"dup")]
-        private void Handle_Dup(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Dup(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
-            var value = valueStack.Peek();
-            valueStack.Push(value);
+            var value = executionState.VirtualStack.Peek();
+            if (value is DeferredExpressionStackValue)
+            {
+                executionState.VirtualStack = executionState.VirtualStack.Pop(out value);
+                ResolveInputValue(value, ref executionState);
+                executionState.VirtualStack = executionState.VirtualStack.Push(value);
+            }
+            executionState.VirtualStack = executionState.VirtualStack.Push(value);
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"pop")]
-        private void Handle_Pop(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Pop(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
-            valueStack.Pop();
+            executionState.VirtualStack = executionState.VirtualStack.Pop(out _);
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"ldarg(\.[0-9])?")]
-        private void Handle_Ldarg(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Ldarg(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            if (instruction.OpCode == OpCodes.Ldarg_0 || instruction.OpCode == OpCodes.Ldarg && (int)instruction.Data == 0)
+            if (instruction.OpCode == OpCodes.Ldarg_0 || (instruction.OpCode == OpCodes.Ldarg && (int)instruction.Data == 0))
             {
-                valueStack.Push(new ThisStackValue());
-                return;
+                executionState.VirtualStack = executionState.VirtualStack.Push(new ThisStackValue());
             }
-            if (instruction.OpCode == OpCodes.Ldarg_1) { valueStack.Push(paramIndexToStackValue[0]); }
-            else if (instruction.OpCode == OpCodes.Ldarg_2) { valueStack.Push(paramIndexToStackValue[1]); }
-            else if (instruction.OpCode == OpCodes.Ldarg_3) { valueStack.Push(paramIndexToStackValue[2]); }
-            else if (instruction.OpCode == OpCodes.Ldarg_S) { valueStack.Push(paramIndexToStackValue[(sbyte)instruction.Data]); }
+            else if (instruction.OpCode == OpCodes.Ldarg_1) { executionState.VirtualStack = executionState.VirtualStack.Push(paramIndexToStackValue[0]); }
+            else if (instruction.OpCode == OpCodes.Ldarg_2) { executionState.VirtualStack = executionState.VirtualStack.Push(paramIndexToStackValue[1]); }
+            else if (instruction.OpCode == OpCodes.Ldarg_3) { executionState.VirtualStack = executionState.VirtualStack.Push(paramIndexToStackValue[2]); }
+            else if (instruction.OpCode == OpCodes.Ldarg_S) { executionState.VirtualStack = executionState.VirtualStack.Push(paramIndexToStackValue[(sbyte)instruction.Data]); }
             else throw new InvalidOperationException();
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"ldstr")]
-        private void Handle_Ldstr(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Ldstr(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            valueStack.Push(new StringStackValue { Value = (string)instruction.Data });
+            executionState.VirtualStack = executionState.VirtualStack.Push(new StringStackValue { Value = (string)instruction.Data });
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"ldnull")]
-        private void Handle_Ldnull(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Ldnull(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
-            valueStack.Push(new NullStackValue());
+            executionState.VirtualStack = executionState.VirtualStack.Push(new NullStackValue());
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"ldind\.[a-z]+[0-9]*")]
-        private void Handle_Ldind(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Ldind(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            var value = valueStack.Pop();
+            executionState.VirtualStack = executionState.VirtualStack.Pop(out var value);
             if (instruction.OpCode == OpCodes.Ldind_Ref && value is DeviceSlotStackValue deviceSlotStackValue)
             {
-                valueStack.Push(value);
-                return;
+                executionState.VirtualStack = executionState.VirtualStack.Push(value);
+                return FragmentText.Empty;
             }
             throw new InvalidOperationException();
         }
 
         [OpCodeHandler(@"ldfld")]
-        private void Handle_Ldfld(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Ldfld(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            var value = valueStack.Pop();
+            executionState.VirtualStack = executionState.VirtualStack.Pop(out var value);
             var fieldInfo = instruction.Data as FieldInfo;
-            if (!(value is ThisStackValue) || fieldInfo == null)
+            if (value is not ThisStackValue || fieldInfo == null)
             {
                 throw new InvalidOperationException($"Can't read fields or properties on unsupported value '${value}'");
             }
@@ -272,26 +366,27 @@ namespace CsToMips.Compiler
             if (deviceAttr != null)
             {
 
-                valueStack.Push(new DeviceStackValue { PinName = deviceAttr.PinName, DeviceType = fieldInfo.FieldType, Multicast = false });
-                return;
+                executionState.VirtualStack = executionState.VirtualStack.Push(new DeviceStackValue { PinName = deviceAttr.PinName, DeviceType = fieldInfo.FieldType, Multicast = false });
+                return FragmentText.Empty;
             }
             var multicastDeviceAttr = fieldInfo.GetCustomAttribute<MulticastDeviceAttribute>();
             if (multicastDeviceAttr != null)
             {
-                valueStack.Push(new DeviceStackValue { PinName = "", DeviceType = fieldInfo.FieldType, Multicast = true });
-                return;
+                executionState.VirtualStack = executionState.VirtualStack.Push(new DeviceStackValue { PinName = "", DeviceType = fieldInfo.FieldType, Multicast = true });
+                return FragmentText.Empty;
             }
-            valueStack.Push(new FieldStackValue { UnderlyingField = fieldInfo, AliasName = fieldInfo.Name });
+            executionState.VirtualStack = executionState.VirtualStack.Push(new FieldStackValue { UnderlyingField = fieldInfo, AliasName = fieldInfo.Name });
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"stfld")]
-        private void Handle_Stfld(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Stfld(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            var value = valueStack.Pop();
-            var target = valueStack.Pop();
+            executionState.VirtualStack = executionState.VirtualStack.Pop2(out var value, out var target);
+            value = ResolveInputValue(value, ref executionState);
             var fieldInfo = instruction.Data as FieldInfo;
-            if (!(target is ThisStackValue) || fieldInfo == null)
+            if (target is not ThisStackValue || fieldInfo == null)
             {
                 throw new InvalidOperationException($"Can't write fields or properties on unsupported value '${value}'");
             }
@@ -305,21 +400,22 @@ namespace CsToMips.Compiler
             {
                 throw new InvalidOperationException($"Can't write device fields");
             }
-            outputWriter.SetCode(instructionIndex, $"move {fieldInfo.Name} {value.AsIC10}");
+            return new FragmentText($"move {fieldInfo.Name} {value.AsIC10}");
         }
 
         [OpCodeHandler(@"call(virt)?")]
-        private void Handle_Call(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Call(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             var method = instruction.Data as MethodBase;
             if (method == null || method.IsConstructor)
             {
                 // This could be a super call on the ctor, for now let's ignore
-                return;
+                return FragmentText.Empty;
             }
-            var callParams = GetCallParameters(method);
-            var callTarget = method.IsStatic ? null : valueStack.Pop();
+            var callParams = GetCallParameters(ref executionState, method);
+            StackValue? callTarget = null;
+            if (!method.IsStatic) { executionState.VirtualStack = executionState.VirtualStack.Pop(out callTarget); }
             CompileHintCallType compileHintCallType;
             string? compileHintPattern;
             var compileHintAttr = method.GetCustomAttribute<CompileHintAttribute>();
@@ -341,7 +437,7 @@ namespace CsToMips.Compiler
             if (!string.IsNullOrEmpty(compileHintPattern))
             {
                 var substitutedPattern = compileHintPattern;
-                
+                string fragmentCode = string.Empty;
                 if (compileHintCallType == CompileHintCallType.Inline)
                 {
                     for (int i = 0; i < callParams.Length; ++i)
@@ -349,28 +445,30 @@ namespace CsToMips.Compiler
                         substitutedPattern = substitutedPattern.Replace($"#{i}", callParams[i].AsIC10);
                     }
                     var tempRegisterMap = new int?[RegisterAllocations.NumTotal];
+                    var tmpExecutionState = executionState;
                     substitutedPattern = new Regex(@"%[0-9]{1,2}").Replace(substitutedPattern, (match) =>
                     {
                         var tempRegisterIdx = int.Parse(match.Value[1..]);
                         if (tempRegisterMap[tempRegisterIdx] == null)
                         {
-                            tempRegisterMap[tempRegisterIdx] = AllocateRegister();
+                            tempRegisterMap[tempRegisterIdx] = AllocateRegister(ref tmpExecutionState);
                         }
                         return $"r{tempRegisterMap[tempRegisterIdx]}";
                     });
+                    executionState = tmpExecutionState;
                     if (method is MethodInfo methodInfo1 && methodInfo1.ReturnType != typeof(void))
                     {
-                        int regIdx = AllocateRegister();
+                        int regIdx = AllocateRegister(ref executionState);
                         var regValue = new RegisterStackValue { RegisterIndex = regIdx };
                         substitutedPattern = substitutedPattern.Replace("$", regValue.AsIC10);
-                        valueStack.Push(regValue);
+                        executionState.VirtualStack = executionState.VirtualStack.Push(regValue);
                     }
                     foreach (var tempReg in tempRegisterMap)
                     {
                         if (tempReg == null) { continue; }
-                        CheckFree(new RegisterStackValue { RegisterIndex = tempReg.Value });
+                        CheckFree(ref executionState, new RegisterStackValue { RegisterIndex = tempReg.Value });
                     }
-                    outputWriter.SetCode(instructionIndex, substitutedPattern);
+                    fragmentCode = substitutedPattern;
                 }
                 else if (compileHintCallType == CompileHintCallType.CallStack)
                 {
@@ -380,8 +478,8 @@ namespace CsToMips.Compiler
                 {
                     throw new NotImplementedException();
                 }
-                CheckFree(callParams);
-                return;
+                CheckFree(ref executionState, callParams);
+                return new FragmentText(fragmentCode);
             }
             if (method.Name.StartsWith("set_"))
             {
@@ -391,17 +489,18 @@ namespace CsToMips.Compiler
                     throw new InvalidOperationException($"Can't call methods on unsupported value '{callTarget}'");
                 }
                 string propertyName = method.Name[4..];
+                string fragmentCode;
                 if (deviceStackValue.Multicast)
                 {
                     int typeHash = deviceStackValue.DeviceType.GetCustomAttribute<DeviceInterfaceAttribute>()?.TypeHash ?? 0;
-                    outputWriter.SetCode(instructionIndex, $"sb {typeHash} {propertyName} {valueToWrite.AsIC10}");
+                    fragmentCode = $"sb {typeHash} {propertyName} {valueToWrite.AsIC10}";
                 }
                 else
                 {
-                    outputWriter.SetCode(instructionIndex, $"s {callTarget.AsIC10} {propertyName} {valueToWrite.AsIC10}");
+                    fragmentCode = $"s {callTarget.AsIC10} {propertyName} {valueToWrite.AsIC10}";
                 }
-                CheckFree(callParams);
-                return;
+                CheckFree(ref executionState, callParams);
+                return new FragmentText(fragmentCode);
             }
             if (method.Name.StartsWith("get_"))
             {
@@ -409,39 +508,40 @@ namespace CsToMips.Compiler
                 {
                     if (method.Name == "get_Item")
                     {
-                        valueStack.Push(new DeviceSlotStackValue { DeviceType = deviceSlotsStackValue.DeviceType, PinName = deviceSlotsStackValue.PinName, SlotIndex = callParams[0] });
-                        return;
+                        executionState.VirtualStack = executionState.VirtualStack.Push(new DeviceSlotStackValue { DeviceType = deviceSlotsStackValue.DeviceType, PinName = deviceSlotsStackValue.PinName, SlotIndex = callParams[0] });
+                        return FragmentText.Empty;
                     }
                     if (method.Name == "get_Length")
                     {
-                        valueStack.Push(new StaticStackValue { Value = deviceSlotsStackValue.DeviceType.GetProperty("Slots", BindingFlags.Public | BindingFlags.Instance)?.GetCustomAttribute<DeviceSlotCountAttribute>()?.SlotCount ?? 0 });
-                        return;
+                        executionState.VirtualStack = executionState.VirtualStack.Push(new StaticStackValue { Value = deviceSlotsStackValue.DeviceType.GetProperty("Slots", BindingFlags.Public | BindingFlags.Instance)?.GetCustomAttribute<DeviceSlotCountAttribute>()?.SlotCount ?? 0 });
+                        return FragmentText.Empty;
                     }
                 }
                 if (callTarget is DeviceSlotStackValue deviceSlotStackValue)
                 {
                     string propertyName = method.Name[4..];
-                    var regIdx = AllocateRegister();
-                    var regValue = new RegisterStackValue { RegisterIndex = regIdx };
-                    outputWriter.SetCode(instructionIndex, $"ls {regValue.AsIC10} {deviceSlotStackValue.PinName} {deviceSlotStackValue.SlotIndex.AsIC10} {propertyName}");
-                    CheckFree(deviceSlotStackValue.SlotIndex);
-                    valueStack.Push(regValue);
-                    return;
+                    executionState.VirtualStack = executionState.VirtualStack.Push(new DeferredExpressionStackValue
+                    {
+                        ExpressionText = new FragmentText($"ls $ {deviceSlotStackValue.PinName} {deviceSlotStackValue.SlotIndex.AsIC10} {propertyName}"),
+                        FreeValues = new StackValue[] { deviceSlotStackValue.SlotIndex }.ToImmutableArray(),
+                    });
+                    return FragmentText.Empty;
                 }
                 if (callTarget is DeviceStackValue deviceStackValue)
                 {
                     if (deviceStackValue.Multicast) { throw new InvalidOperationException($"Tried to do non-multicast device read on multicast device pin"); }
                     if (method.Name == "get_Slots")
                     {
-                        valueStack.Push(new DeviceSlotsStackValue { DeviceType = deviceStackValue.DeviceType, PinName = deviceStackValue.PinName });
-                        return;
+                        executionState.VirtualStack = executionState.VirtualStack.Push(new DeviceSlotsStackValue { DeviceType = deviceStackValue.DeviceType, PinName = deviceStackValue.PinName });
+                        return FragmentText.Empty;
                     }
                     string propertyName = method.Name[4..];
-                    var regIdx = AllocateRegister();
-                    var regValue = new RegisterStackValue { RegisterIndex = regIdx };
-                    outputWriter.SetCode(instructionIndex, $"l {regValue.AsIC10} {callTarget.AsIC10} {propertyName}");
-                    valueStack.Push(regValue);
-                    return;
+                    executionState.VirtualStack = executionState.VirtualStack.Push(new DeferredExpressionStackValue
+                    {
+                        ExpressionText = new FragmentText($"l $ {callTarget.AsIC10} {propertyName}"),
+                        FreeValues = ImmutableArray<StackValue>.Empty,
+                    });
+                    return FragmentText.Empty;
                 }
                 throw new InvalidOperationException($"Can't call methods on unsupported value '{callTarget}'");
             }
@@ -451,28 +551,38 @@ namespace CsToMips.Compiler
                 if (deviceType == null) { throw new InvalidOperationException(); }
                 var deviceInterfaceAttr = deviceType.GetCustomAttribute<DeviceInterfaceAttribute>();
                 if (deviceInterfaceAttr == null) { throw new InvalidOperationException($"GetTypeHash must be called with a valid device interface"); }
-                valueStack.Push(new StaticStackValue { Value = deviceInterfaceAttr.TypeHash });
-                CheckFree(callParams);
-                return;
+                executionState.VirtualStack = executionState.VirtualStack.Push(new StaticStackValue { Value = deviceInterfaceAttr.TypeHash });
+                CheckFree(ref executionState, callParams);
+                return FragmentText.Empty;
             }
             if (method is MethodInfo methodInfo)
             {
                 if (callTarget is ThisStackValue || callTarget == null)
                 {
-                    ConstructCallSite(callParams, method, instructionIndex, outputWriter);
-                    return;
+                    methodDependencies.Add(method);
+                    StackValue? returnParam = null;
+                    if (methodInfo.ReturnType != typeof(void))
+                    {
+                        var regIdx = AllocateRegister(ref executionState);
+                        var regValue = new RegisterStackValue { RegisterIndex = regIdx };
+                        executionState.VirtualStack = executionState.VirtualStack.Push(regValue);
+                        returnParam = regValue;
+                    }
+                    var preReturnRegisterAllocs = executionState.RegisterAllocations;
+                    CheckFree(ref executionState, callParams);
+                    return new FragmentText(string.Empty, new CallBinding(method, callParams, returnParam, preReturnRegisterAllocs));
                 }
                 else if (callTarget is DeviceStackValue deviceStackValue && methodInfo.Name.StartsWith("Get"))
                 {
                     if (!deviceStackValue.Multicast) { throw new InvalidOperationException($"Tried to do multicast device read on non-multicast device pin"); }
                     string propertyName = method.Name[3..];
-                    var regIdx = AllocateRegister();
+                    var regIdx = AllocateRegister(ref executionState);
                     var regValue = new RegisterStackValue { RegisterIndex = regIdx };
                     int typeHash = deviceStackValue.DeviceType.GetCustomAttribute<DeviceInterfaceAttribute>()?.TypeHash ?? 0;
-                    outputWriter.SetCode(instructionIndex, $"lb {regValue.AsIC10} {typeHash} {callTarget.AsIC10} {propertyName} {callParams[0].AsIC10}");
-                    valueStack.Push(regValue);
-                    CheckFree(callParams);
-                    return;
+                    var code = $"lb {regValue.AsIC10} {typeHash} {callTarget.AsIC10} {propertyName} {callParams[0].AsIC10}";
+                    executionState.VirtualStack = executionState.VirtualStack.Push(regValue);
+                    CheckFree(ref executionState, callParams);
+                    return new FragmentText(code);
                 }
                 throw new InvalidOperationException($"Can't call unsupported method '{method}'");
             }
@@ -481,17 +591,17 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"b(r|eq|ge|gt|le|lt|ne|rfalse|rtrue|rzero)(\.un)?(\.s)?")]
-        private void Handle_Branch(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Branch(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             int offset;
-            if (instruction.Data is int)
+            if (instruction.Data is int intData)
             {
-                offset = (int)instruction.Data;
+                offset = intData;
             }
-            else if (instruction.Data is sbyte)
+            else if (instruction.Data is sbyte sbyteData)
             {
-                offset = (sbyte)instruction.Data;
+                offset = sbyteData;
             }
             else
             {
@@ -516,60 +626,63 @@ namespace CsToMips.Compiler
             string inst = "j";
             if (!string.IsNullOrEmpty(cmd2Arg))
             {
-                var rhs = valueStack.Pop();
-                var lhs = valueStack.Pop();
+                executionState.VirtualStack = executionState.VirtualStack.Pop2(out var rhs, out var lhs);
+                lhs = ResolveInputValue(lhs, ref executionState);
+                rhs = ResolveInputValue(rhs, ref executionState);
                 inst = $"{cmd2Arg} {lhs.AsIC10} {rhs.AsIC10}";
-                CheckFree(rhs);
-                CheckFree(lhs);
+                CheckFree(ref executionState, rhs);
+                CheckFree(ref executionState, lhs);
             }
             else if (!string.IsNullOrEmpty(cmd1Arg))
             {
-                var lhs = valueStack.Pop();
-                if (lhs is DeviceStackValue deviceStackValue)
+                executionState.VirtualStack = executionState.VirtualStack.Pop(out var lhs);
+                lhs = ResolveInputValue(lhs, ref executionState);
+                if (lhs is DeviceStackValue)
                 {
                     if (instruction.OpCode == OpCodes.Brtrue || instruction.OpCode == OpCodes.Brtrue_S) { cmd1Arg = "bdse"; }
                     else if (instruction.OpCode == OpCodes.Brfalse || instruction.OpCode == OpCodes.Brfalse_S) { cmd1Arg = "bdns"; }
                     else { throw new InvalidOperationException(); }
                 }
                 inst = $"{cmd1Arg} {lhs.AsIC10}";
-                CheckFree(lhs);
+                CheckFree(ref executionState, lhs);
             }
 
             for (int i = 0; i < instructions.Length; ++i)
             {
                 if (instructions[i].Offset == absOffset)
                 {
-                    outputWriter.SetWithLabel(i, true);
-                    outputWriter.SetCode(instructionIndex, $"{inst} {outputWriter.GetLabel(i)}");
-                    return;
+                    return new FragmentText($"{inst} {GetInstructionLabel(i)}", branchTargets: new int[] { i }.ToImmutableArray());
                 }
             }
             throw new InvalidOperationException();
         }
 
         [OpCodeHandler(@"ldc(\.[ir][0-9](\.(m)?[0-9])?)?(\.s)?")]
-        private void Handle_Ldc(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Ldc(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            if (instruction.OpCode == OpCodes.Ldc_I4) { valueStack.Push(new StaticStackValue { Value = (int)instruction.Data }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_0) { valueStack.Push(new StaticStackValue { Value = 0 }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_1) { valueStack.Push(new StaticStackValue { Value = 1 }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_2) { valueStack.Push(new StaticStackValue { Value = 2 }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_3) { valueStack.Push(new StaticStackValue { Value = 3 }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_4) { valueStack.Push(new StaticStackValue { Value = 4 }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_5) { valueStack.Push(new StaticStackValue { Value = 5 }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_6) { valueStack.Push(new StaticStackValue { Value = 6 }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_7) { valueStack.Push(new StaticStackValue { Value = 7 }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_8) { valueStack.Push(new StaticStackValue { Value = 8 }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_S) { valueStack.Push(new StaticStackValue { Value = (byte)instruction.Data }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_I4_M1) { valueStack.Push(new StaticStackValue { Value = -1 }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_R4) { valueStack.Push(new StaticStackValue { Value = (float)instruction.Data }); return; }
-            else if (instruction.OpCode == OpCodes.Ldc_R8) { valueStack.Push(new StaticStackValue { Value = (float)(double)instruction.Data }); return; }
-            throw new InvalidOperationException();
+            StackValue valueToPush;
+            if (instruction.OpCode == OpCodes.Ldc_I4) { valueToPush = new StaticStackValue { Value = (int)instruction.Data }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_0) { valueToPush = new StaticStackValue { Value = 0 }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_1) { valueToPush = new StaticStackValue { Value = 1 }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_2) { valueToPush = new StaticStackValue { Value = 2 }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_3) { valueToPush = new StaticStackValue { Value = 3 }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_4) { valueToPush = new StaticStackValue { Value = 4 }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_5) { valueToPush = new StaticStackValue { Value = 5 }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_6) { valueToPush = new StaticStackValue { Value = 6 }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_7) { valueToPush = new StaticStackValue { Value = 7 }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_8) { valueToPush = new StaticStackValue { Value = 8 }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_S) { valueToPush = new StaticStackValue { Value = (byte)instruction.Data }; }
+            else if (instruction.OpCode == OpCodes.Ldc_I4_M1) { valueToPush = new StaticStackValue { Value = -1 }; }
+            else if (instruction.OpCode == OpCodes.Ldc_R4) { valueToPush = new StaticStackValue { Value = (float)instruction.Data }; }
+            else if (instruction.OpCode == OpCodes.Ldc_R8) { valueToPush = new StaticStackValue { Value = (float)(double)instruction.Data }; }
+            else throw new InvalidOperationException();
+            executionState.VirtualStack = executionState.VirtualStack.Push(valueToPush);
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"stloc(\.[0-9]|\.s)?")]
-        private void Handle_Stloc(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Stloc(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             int localVariableIndex;
@@ -580,17 +693,37 @@ namespace CsToMips.Compiler
             else if (instruction.OpCode == OpCodes.Stloc_3) { localVariableIndex = 3; }
             else if (instruction.OpCode == OpCodes.Stloc_S) { localVariableIndex = (sbyte)instruction.Data; }
             else { throw new InvalidOperationException(); }
-            var value = valueStack.Pop();
-            localVariableKnownStates[localVariableIndex] = value;
-            if (localVariableRegisters[localVariableIndex] != -1)
+            executionState.VirtualStack = executionState.VirtualStack.Pop(out var value);
+            if (value is DeferredExpressionStackValue deferredExpressionStackValue)
             {
-                outputWriter.SetCode(instructionIndex, $"move r{localVariableRegisters[localVariableIndex]} {value.AsIC10}");
+                FragmentText fragmentText = FragmentText.Empty;
+                if (executionState.LocalVariableRegisterMappings[localVariableIndex] != -1)
+                {
+                    fragmentText = deferredExpressionStackValue.ExpressionText.Replace("$", $"r{executionState.LocalVariableRegisterMappings[localVariableIndex]}");
+                }
+                foreach (var deferredInput in deferredExpressionStackValue.FreeValues)
+                {
+                    CheckFree(ref executionState, deferredInput);
+                }
+                executionState.LocalVariableKnownStates = executionState.LocalVariableKnownStates.SetItem(localVariableIndex, null);
+                return fragmentText;
             }
-            CheckFree(value);
+            executionState.LocalVariableKnownStates = executionState.LocalVariableKnownStates.SetItem(localVariableIndex, value);
+            string code = string.Empty;
+            if (value is RegisterStackValue registerStackValue)
+            {
+                // We don't want to leave the register hanging and allocated since we don't really know when this local var will be reused, so do a horrible move
+                if (executionState.LocalVariableRegisterMappings[localVariableIndex] != -1)
+                {
+                    code = $"move r{executionState.LocalVariableRegisterMappings[localVariableIndex]} {value.AsIC10}";
+                }
+            }
+            CheckFree(ref executionState, value);
+            return new FragmentText(code);
         }
 
         [OpCodeHandler(@"ldloc(\.[0-9]|\.s)?")]
-        private void Handle_Ldloc(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Ldloc(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             int localVariableIndex;
@@ -601,32 +734,38 @@ namespace CsToMips.Compiler
             else if (instruction.OpCode == OpCodes.Ldloc_3) { localVariableIndex = 3; }
             else if (instruction.OpCode == OpCodes.Ldloc_S) { localVariableIndex = (sbyte)instruction.Data; }
             else { throw new InvalidOperationException(); }
-            valueStack.Push(new RegisterStackValue { RegisterIndex = localVariableRegisters[localVariableIndex] });
+            var knownState = executionState.LocalVariableKnownStates[localVariableIndex];
+            if (knownState != null)
+            {
+                executionState.VirtualStack = executionState.VirtualStack.Push(knownState);
+                return FragmentText.Empty;
+            }
+            executionState.VirtualStack = executionState.VirtualStack.Push(new RegisterStackValue { RegisterIndex = executionState.LocalVariableRegisterMappings[localVariableIndex] });
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"ldloca(\.s)?")]
-        private void Handle_Ldloca(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Ldloca(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             int localVariableIndex;
             if (instruction.OpCode == OpCodes.Ldloca) { localVariableIndex = (int)instruction.Data; }
             else if (instruction.OpCode == OpCodes.Ldloca_S) { localVariableIndex = (sbyte)instruction.Data; }
             else { throw new InvalidOperationException(); }
-            if (localVariableKnownStates[localVariableIndex] is DeviceSlotsStackValue deviceSlotsStackValue)
+            if (executionState.LocalVariableKnownStates[localVariableIndex] is DeviceSlotsStackValue deviceSlotsStackValue)
             {
-                valueStack.Push(deviceSlotsStackValue);
-                return;
+                executionState.VirtualStack = executionState.VirtualStack.Push(deviceSlotsStackValue);
+                return FragmentText.Empty;
             }
 
             throw new NotImplementedException();
         }
 
         [OpCodeHandler(@"add|sub|mul|div|and|or|xor")]
-        private void Handle_BinaryArithmetic(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_BinaryArithmetic(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            var rhs = valueStack.Pop();
-            var lhs = valueStack.Pop();
+            executionState.VirtualStack = executionState.VirtualStack.Pop2(out var rhs, out var lhs);
             if (lhs is StaticStackValue lhsStatic && rhs is StaticStackValue rhsStatic)
             {
                 float result;
@@ -638,9 +777,11 @@ namespace CsToMips.Compiler
                 else if (instruction.OpCode == OpCodes.Or) { result = (lhsStatic.Value != 0.0f || rhsStatic.Value != 0.0f) ? 1.0f : 0.0f; }
                 else if (instruction.OpCode == OpCodes.Xor) { result = (int)lhsStatic.Value ^ (int)rhsStatic.Value; }
                 else { throw new InvalidOperationException(); }
-                valueStack.Push(new StaticStackValue { Value = result });
-                return;
+                executionState.VirtualStack = executionState.VirtualStack.Push(new StaticStackValue { Value = result });
+                return FragmentText.Empty;
             }
+            lhs = ResolveInputValue(lhs, ref executionState);
+            rhs = ResolveInputValue(rhs, ref executionState);
             string ic10;
             if (instruction.OpCode == OpCodes.Add) { ic10 = "add"; }
             else if (instruction.OpCode == OpCodes.Sub) { ic10 = "sub"; }
@@ -650,45 +791,61 @@ namespace CsToMips.Compiler
             else if (instruction.OpCode == OpCodes.Or) { ic10 = "or"; }
             else if (instruction.OpCode == OpCodes.Xor) { ic10 = "xor"; }
             else { throw new InvalidOperationException(); }
-            EmitWriteInstruction($"{ic10} $ {lhs.AsIC10} {rhs.AsIC10}", instructions, ref instructionIndex, outputWriter);
-            CheckFree(rhs);
-            CheckFree(lhs);
+            executionState.VirtualStack = executionState.VirtualStack.Push(new DeferredExpressionStackValue
+            {
+                ExpressionText = new FragmentText($"{ic10} $ {lhs.AsIC10} {rhs.AsIC10}"),
+                FreeValues = new StackValue[] { lhs, rhs }.ToImmutableArray(),
+            });
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"not")]
-        private void Handle_UnaryArithmetic(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_UnaryArithmetic(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            var rhs = valueStack.Pop();
+            executionState.VirtualStack = executionState.VirtualStack.Pop(out var rhs);
+            rhs = ResolveInputValue(rhs, ref executionState);
             string ic10;
             if (instruction.OpCode == OpCodes.Not) { ic10 = "not"; }
             else { throw new InvalidOperationException(); }
-            EmitWriteInstruction($"{ic10} $ {rhs.AsIC10}", instructions, ref instructionIndex, outputWriter);
-            CheckFree(rhs);
+            executionState.VirtualStack = executionState.VirtualStack.Push(new DeferredExpressionStackValue
+            {
+                ExpressionText = new FragmentText($"{ic10} $ {rhs.AsIC10}"),
+                FreeValues = new StackValue[] { rhs }.ToImmutableArray(),
+            });
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"neg")]
-        private void Handle_Neg(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Neg(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
-            var value = valueStack.Pop();
-            EmitWriteInstruction($"sub $ 0 {value.AsIC10}", instructions, ref instructionIndex, outputWriter);
-            CheckFree(value);
+            executionState.VirtualStack = executionState.VirtualStack.Pop(out var rhs);
+            rhs = ResolveInputValue(rhs, ref executionState);
+            executionState.VirtualStack = executionState.VirtualStack.Push(new DeferredExpressionStackValue
+            {
+                ExpressionText = new FragmentText($"sub $ 0 {rhs.AsIC10}"),
+                FreeValues = new StackValue[] { rhs }.ToImmutableArray(),
+            });
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"(ceq|cgt|clt)(\.un)?")]
-        private void Handle_Compare(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Compare(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            var rhs = valueStack.Pop();
-            var lhs = valueStack.Pop();
+            executionState.VirtualStack = executionState.VirtualStack.Pop2(out var rhs, out var lhs);
+            lhs = ResolveInputValue(lhs, ref executionState);
+            rhs = ResolveInputValue(rhs, ref executionState);
             if (((lhs is DeviceStackValue && rhs is NullStackValue) || (rhs is DeviceStackValue && lhs is NullStackValue)) && instruction.OpCode == OpCodes.Cgt_Un)
             {
                 var deviceStackValue = (lhs as DeviceStackValue) ?? (rhs as DeviceStackValue);
                 if (deviceStackValue == null) { throw new InvalidOperationException(); }
-                EmitWriteInstruction($"sdse $ {deviceStackValue.AsIC10}", instructions, ref instructionIndex, outputWriter);
-                CheckFree(rhs);
-                CheckFree(lhs);
-                return;
+                executionState.VirtualStack = executionState.VirtualStack.Push(new DeferredExpressionStackValue
+                {
+                    ExpressionText = new FragmentText($"sdse $ {deviceStackValue.AsIC10}"),
+                    FreeValues = new StackValue[] { lhs, rhs }.ToImmutableArray(),
+                });
+                return FragmentText.Empty;
             }
             string ic10;
             if (instruction.OpCode == OpCodes.Ceq) { ic10 = "seq"; }
@@ -697,19 +854,24 @@ namespace CsToMips.Compiler
             else if (instruction.OpCode == OpCodes.Clt) { ic10 = "slt"; }
             else if (instruction.OpCode == OpCodes.Clt_Un) { ic10 = "slt"; }
             else { throw new InvalidOperationException(); }
-            EmitWriteInstruction($"{ic10} $ {lhs.AsIC10} {rhs.AsIC10}", instructions, ref instructionIndex, outputWriter);
-            CheckFree(rhs);
-            CheckFree(lhs);
+            executionState.VirtualStack = executionState.VirtualStack.Push(new DeferredExpressionStackValue
+            {
+                ExpressionText = new FragmentText($"{ic10} $ {lhs.AsIC10} {rhs.AsIC10}"),
+                FreeValues = new StackValue[] { lhs, rhs }.ToImmutableArray(),
+            });
+            return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"switch")]
-        private void Handle_Switch(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Switch(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
-            var switchValue = valueStack.Pop();
+            executionState.VirtualStack = executionState.VirtualStack.Pop(out var switchValue);
+            switchValue = ResolveInputValue(switchValue, ref executionState);
             int[]? offsets = instruction.Data as int[];
             if (offsets == null) { throw new InvalidOperationException(); }
             var sb = new StringBuilder();
+            IList<int> branchTargets = new List<int>();
             for (int j = 0; j < offsets.Length; ++j)
             {
                 var offset = offsets[j];
@@ -719,120 +881,95 @@ namespace CsToMips.Compiler
                 {
                     if (instructions[i].Offset == absOffset)
                     {
-                        outputWriter.SetWithLabel(i, true);
-                        sb.AppendLine($"beq {switchValue.AsIC10} {j} {outputWriter.GetLabel(i)}");
+                        branchTargets.Add(i);
+                        sb.AppendLine($"beq {switchValue.AsIC10} {j} {GetInstructionLabel(i)}");
                         found = true;
                         break;
                     }
                 }
                 if (!found) { throw new InvalidOperationException(); }
             }
-            outputWriter.SetCode(instructionIndex, sb.ToString().Trim());
-            CheckFree(switchValue);
+            CheckFree(ref executionState, switchValue);
+            return new FragmentText(sb.ToString(), null, branchTargets.ToImmutableArray());
         }
 
         [OpCodeHandler(@"ret")]
-        private void Handle_Ret(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Ret(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
-            var instruction = instructions[instructionIndex];
-            if (method.IsConstructor || method is not MethodInfo methodInfo) { return; }
+            if (method.IsConstructor || method is not MethodInfo methodInfo) { return FragmentText.Empty; }
             if (isInline)
             {
                 if (methodInfo.ReturnType == typeof(void))
                 {
-                    outputWriter.SetCode(instructionIndex, $"j {outputWriter.LabelPrefix}_end");
-                    return;
+                    return new FragmentText($"j {localLabelPrefix}_end");
                 }
                 if (returnStackValue is not RegisterStackValue registerStackValue) { throw new InvalidOperationException(); }
-                var retVal = valueStack.Pop();
-                outputWriter.SetCode(instructionIndex, $"move {registerStackValue.AsIC10} {retVal.AsIC10}{Environment.NewLine}j {outputWriter.LabelPrefix}_end");
-                CheckFree(retVal);
+                executionState.VirtualStack = executionState.VirtualStack.Pop(out var retVal);
+                if (retVal is DeferredExpressionStackValue deferredExpressionStackValue)
+                {
+                    return deferredExpressionStackValue.ExpressionText.Replace("$", registerStackValue.AsIC10) + new FragmentText($"j {localLabelPrefix}_end");
+                }
+                CheckFree(ref executionState, retVal);
+                return new FragmentText($"move {registerStackValue.AsIC10} {retVal.AsIC10}{Environment.NewLine}j {localLabelPrefix}_end");
             }
             else
             {
                 if (methodInfo.ReturnType == typeof(void))
                 {
-                    outputWriter.SetCode(instructionIndex, $"j ra");
-                    return;
+                    return new FragmentText($"j ra");
                 }
-                var retVal = valueStack.Pop();
-                outputWriter.SetCode(instructionIndex, $"push {retVal.AsIC10}{Environment.NewLine}j ra");
-                CheckFree(retVal);
+                executionState.VirtualStack = executionState.VirtualStack.Pop(out var retVal);
+                retVal = ResolveInputValue(retVal, ref executionState);
+                CheckFree(ref executionState, retVal);
+                return new FragmentText($"push {retVal.AsIC10}{Environment.NewLine}j ra");
             }
             
         }
 
         [OpCodeHandler(@"conv\..+")]
-        private void Handle_Conv(ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
+        private FragmentText Handle_Conv(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             // since ic10 only has f32 registers, the only conv we're interested in emitting for is f -> i
             var iname = instruction.OpCode.Name ?? "";
             if (iname.StartsWith("conv.i") || iname.StartsWith("conv.u"))
             {
-                var value = valueStack.Pop();
-                var regIdx = AllocateRegister();
-                var regVal = new RegisterStackValue { RegisterIndex = regIdx };
-                outputWriter.SetCode(instructionIndex, $"trunc {regVal.AsIC10} {value.AsIC10}");
-                valueStack.Push(regVal);
-                CheckFree(value);
-            }
-        }
+                executionState.VirtualStack = executionState.VirtualStack.Pop(out var value);
+                value = ResolveInputValue(value, ref executionState);
 
-        private void EmitWriteInstruction(string pattern, ReadOnlySpan<Instruction> instructions, ref int instructionIndex, OutputWriter outputWriter)
-        {
-            // A common pattern is some IL that pops multiple values off the stack, pushes a single value to the stack, then uses stloc to store in a local variable
-            // Following that the usual way results in an intermediate register being allocated for the single value, followed by a move to shift it to the local variable's register
-            // This could be optimised out by having the instruction store directly to the local variable, skipping the need for an intermediate register
-            // This sort of optimisation COULD be handled by the optimiser when it gets upgraded to understand flow and register usage spans, but for now we can handle it by peeking ahead for a stloc
-            if (instructionIndex < instructions.Length - 1)
-            {
-                var nextInstruction = instructions[instructionIndex + 1];
-                int? localVariableIndex = null;
-                if (nextInstruction.OpCode == OpCodes.Stloc) { localVariableIndex = (int)nextInstruction.Data; }
-                else if (nextInstruction.OpCode == OpCodes.Stloc_0) { localVariableIndex = 0; }
-                else if (nextInstruction.OpCode == OpCodes.Stloc_1) { localVariableIndex = 1; }
-                else if (nextInstruction.OpCode == OpCodes.Stloc_2) { localVariableIndex = 2; }
-                else if (nextInstruction.OpCode == OpCodes.Stloc_3) { localVariableIndex = 3; }
-                else if (nextInstruction.OpCode == OpCodes.Stloc_S) { localVariableIndex = (sbyte)nextInstruction.Data; }
-                if (localVariableIndex != null)
+                executionState.VirtualStack = executionState.VirtualStack.Push(new DeferredExpressionStackValue
                 {
-                    var localVarRegIdx = localVariableRegisters[localVariableIndex.Value];
-                    if (localVarRegIdx != -1)
-                    {
-                        outputWriter.SetCode(instructionIndex, pattern.Replace("$", $"r{localVarRegIdx}"));
-                        ++instructionIndex;
-                        return;
-                    }
-                }
+                    ExpressionText = new FragmentText($"trunc $ {value.AsIC10}"),
+                    FreeValues = new StackValue[] { value }.ToImmutableArray(),
+                });
             }
-            var regIdx = AllocateRegister();
-            var regValue = new RegisterStackValue { RegisterIndex = regIdx };
-            outputWriter.SetCode(instructionIndex, pattern.Replace("$", regValue.AsIC10));
-            valueStack.Push(regValue);
+            return FragmentText.Empty;
         }
 
-        private void ConstructCallSite(StackValue[] callParams, MethodBase method, int instructionIndex, OutputWriter outputWriter)
+        private StackValue ResolveInputValue(StackValue stackValue, ref ExecutionState executionState)
         {
-            methodDependencies.Add(method);
-            CheckFree(callParams);
-            StackValue? returnParam = null;
-            var preReturnRegisterAllocs = currentRegisterAllocations;
-            if (method is MethodInfo methodInfo && methodInfo.ReturnType != typeof(void))
+            if (stackValue is DeferredExpressionStackValue deferredExpressionStackValue)
             {
-                var regIdx = AllocateRegister();
-                var regValue = new RegisterStackValue { RegisterIndex = regIdx };
-                valueStack.Push(regValue);
-                returnParam = regValue;
+                int regIdx = AllocateRegister(ref executionState);
+                var reg = new RegisterStackValue { RegisterIndex = regIdx };
+                executionState.PendingIntermediateFragments = executionState.PendingIntermediateFragments.Add(deferredExpressionStackValue.ExpressionText.Replace("$", reg.AsIC10));
+                foreach (var deferredInput in deferredExpressionStackValue.FreeValues)
+                {
+                    CheckFree(ref executionState, deferredInput);
+                }
+                return reg;
             }
-            callSites.Add(new CallSite(instructionIndex, method, callParams, returnParam, preReturnRegisterAllocs, valueStack.ToArray()));
+            else
+            {
+                return stackValue;
+            }
         }
 
         public void FixupCallSites(IReadOnlyDictionary<MethodBase, (ExecutionContext, OutputWriter)> contexts, OutputWriter outputWriter)
         {
-            foreach (var callSite in callSites)
+            foreach (var callSite in allCallSites)
             {
-                var (methodContext, methodOutputWriter) = contexts[callSite.TargetMethod];
+                var (methodContext, methodOutputWriter) = contexts[callSite.Binding.TargetMethod];
                 FixupCallSite(contexts, callSite, methodContext, methodOutputWriter, outputWriter);
             }
         }
@@ -873,11 +1010,11 @@ namespace CsToMips.Compiler
                 }
             }
             sb.AppendLine("push ra");
-            for (int i = 0; i < callSite.CallParams.Length; ++i)
+            for (int i = 0; i < callSite.Binding.CallParams.Length; ++i)
             {
-                sb.AppendLine($"push {callSite.CallParams[i].AsIC10}");
+                sb.AppendLine($"push {callSite.Binding.CallParams[i].AsIC10}");
             }
-            sb.AppendLine($"jal {callSite.TargetMethod.Name}");
+            sb.AppendLine($"jal {callSite.Binding.TargetMethod.Name}");
             sb.AppendLine("pop ra");
             for (int i = 0; i < RegisterAllocations.NumTotal; ++i)
             {
@@ -892,16 +1029,16 @@ namespace CsToMips.Compiler
         private int EstimateCallStackCallInstructionCount(in CallSite callSite, ExecutionContext methodContext)
         {
             var conflictingRegisters = methodContext.allUsedRegisters & callSite.RegistersState & ~reservedRegisters;
-            return conflictingRegisters.NumAllocated + callSite.CallParams.Length + 3;
+            return conflictingRegisters.NumAllocated + callSite.Binding.CallParams.Length + 3;
         }
 
         private void GenerateInlineCall(IReadOnlyDictionary<MethodBase, (ExecutionContext, OutputWriter)> contexts, in CallSite callSite, ExecutionContext methodContext, OutputWriter outputWriter)
         {
             // We can't rely on precompiled method code as it's designed to be called via the call stack, so recompile it inline
             var registers = reservedRegisters | callSite.RegistersState;
-            if (callSite.ReturnParam is RegisterStackValue registerStackValue) { registers.Allocate(registerStackValue.RegisterIndex); }
-            var inlineContext = new ExecutionContext(compilerOptions, registers, callSite.TargetMethod, true, callSite.CallParams.Reverse(), callSite.ReturnParam);
-            var instructions = ILView.ToOpCodes(callSite.TargetMethod).ToArray();
+            if (callSite.Binding.ReturnParam is RegisterStackValue registerStackValue) { registers.Allocate(registerStackValue.RegisterIndex); }
+            var inlineContext = new ExecutionContext(compilerOptions, registers, callSite.Binding.TargetMethod, true, callSite.Binding.CallParams.Reverse(), callSite.Binding.ReturnParam);
+            var instructions = ILView.ToOpCodes(callSite.Binding.TargetMethod).ToArray();
             var inlineOutputWriter = new OutputWriter(instructions.Length);
             inlineOutputWriter.LabelPrefix = $"{outputWriter.GetLabel(callSite.InstructionIndex)}_inl";
             inlineContext.Compile(instructions, inlineOutputWriter);
@@ -909,53 +1046,57 @@ namespace CsToMips.Compiler
             outputWriter.SetCode(callSite.InstructionIndex, inlineOutputWriter.ToString().Trim());
         }
 
-        private StackValue[] GetCallParameters(MethodBase method)
+        private StackValue[] GetCallParameters(ref ExecutionState executionState, MethodBase method)
         {
             var ps = method.GetParameters();
             var paramValues = new StackValue[ps.Length];
             for (int i = 0; i < ps.Length; ++i)
             {
-                paramValues[ps.Length - (i + 1)] = valueStack.Pop();
+                executionState.VirtualStack = executionState.VirtualStack.Pop(out paramValues[ps.Length - (i + 1)]);
+                paramValues[ps.Length - (i + 1)] = ResolveInputValue(paramValues[ps.Length - (i + 1)], ref executionState);
             }
             return paramValues;
         }
 
-        private int AllocateRegister()
+        private int AllocateRegister(ref ExecutionState executionState)
         {
-            currentRegisterAllocations = currentRegisterAllocations.Allocate(out int regIdx);
-            allUsedRegisters |= currentRegisterAllocations;
+            executionState.RegisterAllocations = executionState.RegisterAllocations.Allocate(out int regIdx);
+            allUsedRegisters |= executionState.RegisterAllocations;
             return regIdx;
         }
 
-        private void CheckFree(StackValue stackValue)
+        private void CheckFree(ref ExecutionState executionState, StackValue stackValue)
         {
             if (stackValue is not RegisterStackValue registerStackValue) { return; }
-            int refCount = FindRegisterReferences(registerStackValue.RegisterIndex);
+            int refCount = FindRegisterReferences(ref executionState, registerStackValue.RegisterIndex);
             if (refCount > 0) { return; }
-            currentRegisterAllocations = currentRegisterAllocations.Free(registerStackValue.RegisterIndex);
+            executionState.RegisterAllocations = executionState.RegisterAllocations.Free(registerStackValue.RegisterIndex);
         }
 
-        private void CheckFree(IEnumerable<StackValue> stackValues)
+        private void CheckFree(ref ExecutionState executionState, IEnumerable<StackValue> stackValues)
         {
             foreach (var stackValue in stackValues)
             {
-                CheckFree(stackValue);
+                CheckFree(ref executionState, stackValue);
             }
         }
 
-        private int FindRegisterReferences(int registerIndex)
+        private int FindRegisterReferences(ref ExecutionState executionState, int registerIndex)
         {
             int refCount = 0;
             if (reservedRegisters.IsAllocated(registerIndex)) { ++refCount; }
-            foreach (var item in valueStack)
+            foreach (var item in executionState.VirtualStack.Stack)
             {
                 if (item is RegisterStackValue registerStackValue && registerStackValue.RegisterIndex == registerIndex) { ++refCount; }
             }
-            foreach (var localRegisterIndex in localVariableRegisters)
+            foreach (var localRegisterIndex in executionState.LocalVariableRegisterMappings)
             {
                 if (localRegisterIndex == registerIndex) { ++refCount; }
             }
             return refCount;
         }
+
+        private string GetInstructionLabel(int instructionIndex)
+            => string.IsNullOrEmpty(localLabelPrefix) ? $"il_{instructionIndex}" : $"{localLabelPrefix}_il_{instructionIndex}";
     }
 }

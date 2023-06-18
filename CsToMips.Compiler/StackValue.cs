@@ -52,6 +52,13 @@ namespace CsToMips.Compiler
         public override string AsIC10 { get => Value; }
     }
 
+    internal class HashStringStackValue : StackValue
+    {
+        public string Value { get; set; } = "";
+
+        public override string AsIC10 { get => $"HASH(\"{Value}\")"; }
+    }
+
     internal class NullStackValue : StackValue
     {
         public override string AsIC10 { get { throw new InvalidOperationException(); } }
@@ -104,7 +111,7 @@ namespace CsToMips.Compiler
         public static VirtualStack FromEnumerable(IEnumerable<StackValue> enumerable)
             => new(enumerable.ToArray());
 
-        public override bool Equals(object? obj) => obj is StackValue value && Equals(value);
+        public override bool Equals(object? obj) => obj is VirtualStack value && Equals(value);
 
         public bool Equals(VirtualStack other) => Stack.SequenceEqual(other.Stack);
 

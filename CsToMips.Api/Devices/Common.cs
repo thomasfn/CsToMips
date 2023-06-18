@@ -5,11 +5,11 @@ namespace CsToMips.Devices
     [AttributeUsage(AttributeTargets.Interface, Inherited = false, AllowMultiple = true)]
     public sealed class DeviceInterfaceAttribute : Attribute
     {
-        public readonly int TypeHash;
+        public readonly string TypeName;
 
-        public DeviceInterfaceAttribute(int typeHash)
+        public DeviceInterfaceAttribute(string typeName)
         {
-            TypeHash = typeHash;
+            TypeName = typeName;
         }
     }
 

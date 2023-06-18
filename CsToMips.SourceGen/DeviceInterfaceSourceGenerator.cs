@@ -134,7 +134,7 @@ namespace CsToMips.SourceGen
                 sb.AppendLine($"{prefix}}}");
 
             }
-            sb.AppendLine($"{prefix}[DeviceInterface({thing.PrefabHash})]");
+            sb.AppendLine($"{prefix}[DeviceInterface(\"{thing.PrefabName}\")]");
             sb.AppendLine($"{prefix}public interface I{thing.PrefabName}");
             sb.AppendLine($"{prefix}{{");
             foreach (var logicType in thing.Logic.LogicTypes)
@@ -156,7 +156,7 @@ namespace CsToMips.SourceGen
                 sb.AppendLine($"{prefix}{INDENT}ReadOnlySpan<I{thing.PrefabName}Slot> Slots {{ get; }}");
             }
             sb.AppendLine($"{prefix}}}");
-            sb.AppendLine($"{prefix}[DeviceInterface({thing.PrefabHash})]");
+            sb.AppendLine($"{prefix}[DeviceInterface(\"{thing.PrefabName}\")]");
             sb.AppendLine($"{prefix}public interface IMulticast{thing.PrefabName}");
             sb.AppendLine($"{prefix}{{");
             foreach (var logicType in thing.Logic.LogicTypes)

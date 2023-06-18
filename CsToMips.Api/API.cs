@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Threading;
 
 namespace CsToMips
 {
@@ -50,16 +51,25 @@ namespace CsToMips
 
     public static class IC10Helpers
     {
+        public static event Action? OnYield;
+        public static readonly AutoResetEvent YieldWaitEvent = new AutoResetEvent(false);
+
         [CompileHint("yield", CompileHintCallType.Inline)]
-        public static void Yield() { }
+        public static void Yield()
+        {
+            OnYield?.Invoke();
+            YieldWaitEvent.WaitOne();
+        }
 
         [CompileHint("sleep #0", CompileHintCallType.Inline)]
-        public static void Sleep(float seconds) { }
+        public static void Sleep(float seconds) { Yield(); }
 
         [CompileHint("s db Setting #0", CompileHintCallType.Inline)]
         public static void Debug(float value) { }
 
         public static int GetTypeHash<T>() { return 0; }
+
+        public static int Hash(string str) { return 0; }
 
         [CompileHint("sb #0 #1 #2", CompileHintCallType.Inline)]
         public static void StoreBatch(int typeHash, string varName, double value) { }

@@ -7,6 +7,7 @@ using System.Collections.Immutable;
 namespace CsToMips.Compiler
 {
     using Devices;
+    using System.Runtime.CompilerServices;
 
     [AttributeUsage(AttributeTargets.Method, Inherited = false, AllowMultiple = true)]
     internal sealed class OpCodeHandlerAttribute : Attribute
@@ -41,58 +42,24 @@ namespace CsToMips.Compiler
         public ImmutableArray<FragmentText> PendingIntermediateFragments;
     }
 
-    internal readonly struct CallBinding
-    {
-        public readonly MethodBase TargetMethod;
-        public readonly StackValue[] CallParams;
-        public readonly StackValue? ReturnParam;
-        public readonly RegisterAllocations PreRegisterAllocations;
-
-        public CallBinding(MethodBase targetMethod, StackValue[] callParams, StackValue? returnParam, RegisterAllocations preRegisterAllocations)
-        {
-            TargetMethod = targetMethod;
-            CallParams = callParams;
-            ReturnParam = returnParam;
-            PreRegisterAllocations = preRegisterAllocations;
-        }
-    }
-
-    internal readonly struct CallSite
-    {
-        public readonly int InstructionIndex;
-        public readonly CallBinding Binding;
-        public readonly RegisterAllocations RegistersState;
-        public readonly VirtualStack StackState;
-
-        public CallSite(int instructionIndex, CallBinding binding, RegisterAllocations registersState, VirtualStack stackState)
-        {
-            InstructionIndex = instructionIndex;
-            Binding = binding;
-            RegistersState = registersState;
-            StackState = stackState;
-        }
-    }
-
     internal readonly struct FragmentText
     {
         public readonly string Code;
-        public readonly CallBinding? CallBinding;
         public readonly ImmutableArray<int> BranchTargets;
 
-        public FragmentText(string code, CallBinding? callBinding = null, ImmutableArray<int>? branchTargets = null)
+        public FragmentText(string code, ImmutableArray<int>? branchTargets = null)
         {
             Code = code;
-            CallBinding = callBinding;
             BranchTargets = branchTargets ?? ImmutableArray<int>.Empty;
         }
 
-        public static readonly FragmentText Empty = new(string.Empty, null, null);
+        public static readonly FragmentText Empty = new(string.Empty, null);
 
         public FragmentText Replace(string oldValue, string newValue)
-            => new FragmentText(Code.Replace(oldValue, newValue), CallBinding, BranchTargets);
+            => new FragmentText(Code.Replace(oldValue, newValue), BranchTargets);
 
         public static FragmentText operator +(in FragmentText lhs, in FragmentText rhs)
-            => new FragmentText($"{lhs.Code}{Environment.NewLine}{rhs.Code}".Trim(), lhs.CallBinding ?? rhs.CallBinding, lhs.BranchTargets.AddRange(rhs.BranchTargets));
+            => new FragmentText($"{lhs.Code}{Environment.NewLine}{rhs.Code}".Trim(), lhs.BranchTargets.AddRange(rhs.BranchTargets));
     }
 
     internal readonly struct Fragment
@@ -123,10 +90,9 @@ namespace CsToMips.Compiler
         private readonly MethodBase method;
         private readonly ISet<MethodBase> methodDependencies;
         private readonly StackValue[] paramIndexToStackValue;
-        private readonly StackValue? returnStackValue;
+        private StackValue? returnStackValue;
         private readonly bool isInline;
         private string localLabelPrefix = string.Empty;
-        private readonly IList<CallSite> allCallSites;
 
         private RegisterAllocations allUsedRegisters;
 
@@ -149,6 +115,9 @@ namespace CsToMips.Compiler
             { typeof(Math).GetMethod("Tan", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "tan $ #0" },
             { typeof(Math).GetMethod("Clamp", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double), typeof(double), typeof(double) })!, "max %1 #1 #0\nmin $ #2 %1" },
             { typeof(Math).GetMethod("Clamp", BindingFlags.Public | BindingFlags.Static, new [] { typeof(float), typeof(float), typeof(float) })!, "max %1 #1 #0\nmin $ #2 %1" },
+
+            { typeof(float).GetMethod("IsNaN", BindingFlags.Public | BindingFlags.Static, new [] { typeof(float) })!, "snan $ #0" },
+            { typeof(double).GetMethod("IsNaN", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "snan $ #0" },
         };
 
         public IEnumerable<MethodBase> MethodDependencies => methodDependencies;
@@ -204,7 +173,6 @@ namespace CsToMips.Compiler
             initialExecutionState.PendingIntermediateFragments = ImmutableArray<FragmentText>.Empty;
             this.isInline = isInline;
             this.returnStackValue = returnStackValue;
-            allCallSites = new List<CallSite>();
         }
 
         private static int GetTypeWidth(Type t)
@@ -242,6 +210,7 @@ namespace CsToMips.Compiler
             }
             outputWriter.Preamble = preamble.ToString().Trim();
             var executionState = initialExecutionState;
+            var fragmentList = new Fragment[instructions.Length];
             for (int i = 0; i < instructions.Length; ++i)
             {
                 var fragment = ProcessInstruction(instructions, i, executionState);
@@ -249,15 +218,47 @@ namespace CsToMips.Compiler
                 {
                     throw new InvalidOperationException($"Unhandled instruction {instructions[i]}");
                 }
+                fragmentList[i] = fragment.Value;
                 outputWriter.SetCode(i, fragment.Value.Text.Code);
                 executionState = fragment.Value.PostExecutionState;
                 foreach (var branchTarget in fragment.Value.Text.BranchTargets)
                 {
                     outputWriter.SetWithLabel(branchTarget, true);
                 }
-                if (fragment.Value.Text.CallBinding != null)
+            }
+
+            // Check that all branches have stack and register allocation consistency
+            for (int i = 0; i < instructions.Length; ++i)
+            {
+                ref var fragment = ref fragmentList[i];
+                foreach (var branchTarget in fragment.Text.BranchTargets)
                 {
-                    allCallSites.Add(new CallSite(i, fragment.Value.Text.CallBinding.Value, fragment.Value.PreExecutionState.RegisterAllocations, fragment.Value.PreExecutionState.VirtualStack));
+                    ref var branchFragment = ref fragmentList[branchTarget];
+                    if (fragment.PostExecutionState.VirtualStack != branchFragment.PreExecutionState.VirtualStack)
+                    {
+                        throw new NotImplementedException($"Branch stack inconsistency");
+                    }
+                    if (fragment.PostExecutionState.RegisterAllocations != branchFragment.PreExecutionState.RegisterAllocations)
+                    {
+                        throw new NotImplementedException($"Branch register allocation inconsistency");
+                    }
+                    for (int j = 0; j < fragment.PostExecutionState.LocalVariableKnownStates.Length; ++j)
+                    {
+                        var preBranchVarKnownState = fragment.PostExecutionState.LocalVariableKnownStates[j];
+                        var postBranchVarKnownState = branchFragment.PreExecutionState.LocalVariableKnownStates[j];
+                        if (postBranchVarKnownState == null)
+                        {
+                            // The code that we're jumping to makes no assumptions about the state of the local variable
+                            // So, the current known state of the local variable is irrelevant
+                            continue;
+                        }
+                        if (preBranchVarKnownState != postBranchVarKnownState)
+                        {
+                            // The code that we're jumping to is making an assumption about the state of the local variable
+                            // Furthermore this conflicts with our current known state of the local variable
+                            //throw new NotImplementedException($"Branch local variable known state inconsistency");
+                        }
+                    }
                 }
             }
         }
@@ -492,8 +493,8 @@ namespace CsToMips.Compiler
                 string fragmentCode;
                 if (deviceStackValue.Multicast)
                 {
-                    int typeHash = deviceStackValue.DeviceType.GetCustomAttribute<DeviceInterfaceAttribute>()?.TypeHash ?? 0;
-                    fragmentCode = $"sb {typeHash} {propertyName} {valueToWrite.AsIC10}";
+                    string? typeName = deviceStackValue.DeviceType.GetCustomAttribute<DeviceInterfaceAttribute>()?.TypeName;
+                    fragmentCode = $"sb HASH(\"{typeName}\") {propertyName} {valueToWrite.AsIC10}";
                 }
                 else
                 {
@@ -551,7 +552,14 @@ namespace CsToMips.Compiler
                 if (deviceType == null) { throw new InvalidOperationException(); }
                 var deviceInterfaceAttr = deviceType.GetCustomAttribute<DeviceInterfaceAttribute>();
                 if (deviceInterfaceAttr == null) { throw new InvalidOperationException($"GetTypeHash must be called with a valid device interface"); }
-                executionState.VirtualStack = executionState.VirtualStack.Push(new StaticStackValue { Value = deviceInterfaceAttr.TypeHash });
+                executionState.VirtualStack = executionState.VirtualStack.Push(new HashStringStackValue { Value = deviceInterfaceAttr.TypeName });
+                CheckFree(ref executionState, callParams);
+                return FragmentText.Empty;
+            }
+            if (method.DeclaringType == typeof(IC10Helpers) && method.Name == "Hash")
+            {
+                if (callParams[0] is not StringStackValue stringStackValue) { throw new InvalidOperationException(); }
+                executionState.VirtualStack = executionState.VirtualStack.Push(new HashStringStackValue { Value = stringStackValue.Value });
                 CheckFree(ref executionState, callParams);
                 return FragmentText.Empty;
             }
@@ -559,18 +567,9 @@ namespace CsToMips.Compiler
             {
                 if (callTarget is ThisStackValue || callTarget == null)
                 {
-                    methodDependencies.Add(method);
-                    StackValue? returnParam = null;
-                    if (methodInfo.ReturnType != typeof(void))
-                    {
-                        var regIdx = AllocateRegister(ref executionState);
-                        var regValue = new RegisterStackValue { RegisterIndex = regIdx };
-                        executionState.VirtualStack = executionState.VirtualStack.Push(regValue);
-                        returnParam = regValue;
-                    }
-                    var preReturnRegisterAllocs = executionState.RegisterAllocations;
+                    var callSiteText = GenerateCallSite($"{GetInstructionLabel(instructionIndex)}_inl", methodInfo, callParams, ref executionState);
                     CheckFree(ref executionState, callParams);
-                    return new FragmentText(string.Empty, new CallBinding(method, callParams, returnParam, preReturnRegisterAllocs));
+                    return callSiteText;
                 }
                 else if (callTarget is DeviceStackValue deviceStackValue && methodInfo.Name.StartsWith("Get"))
                 {
@@ -578,8 +577,8 @@ namespace CsToMips.Compiler
                     string propertyName = method.Name[3..];
                     var regIdx = AllocateRegister(ref executionState);
                     var regValue = new RegisterStackValue { RegisterIndex = regIdx };
-                    int typeHash = deviceStackValue.DeviceType.GetCustomAttribute<DeviceInterfaceAttribute>()?.TypeHash ?? 0;
-                    var code = $"lb {regValue.AsIC10} {typeHash} {callTarget.AsIC10} {propertyName} {callParams[0].AsIC10}";
+                    string? typeName = deviceStackValue.DeviceType.GetCustomAttribute<DeviceInterfaceAttribute>()?.TypeName;
+                    var code = $"lb {regValue.AsIC10} HASH(\"{typeName}\") {callTarget.AsIC10} {propertyName} {callParams[0].AsIC10}";
                     executionState.VirtualStack = executionState.VirtualStack.Push(regValue);
                     CheckFree(ref executionState, callParams);
                     return new FragmentText(code);
@@ -761,7 +760,7 @@ namespace CsToMips.Compiler
             throw new NotImplementedException();
         }
 
-        [OpCodeHandler(@"add|sub|mul|div|and|or|xor")]
+        [OpCodeHandler(@"add|sub|mul|div|and|or|xor|shl|shr")]
         private FragmentText Handle_BinaryArithmetic(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
@@ -776,6 +775,9 @@ namespace CsToMips.Compiler
                 else if (instruction.OpCode == OpCodes.And) { result = (lhsStatic.Value != 0.0f && rhsStatic.Value != 0.0f) ? 1.0f : 0.0f; }
                 else if (instruction.OpCode == OpCodes.Or) { result = (lhsStatic.Value != 0.0f || rhsStatic.Value != 0.0f) ? 1.0f : 0.0f; }
                 else if (instruction.OpCode == OpCodes.Xor) { result = (int)lhsStatic.Value ^ (int)rhsStatic.Value; }
+                else if (instruction.OpCode == OpCodes.Shl) { result = (int)lhsStatic.Value << (int)rhsStatic.Value; }
+                else if (instruction.OpCode == OpCodes.Shr) { result = (int)lhsStatic.Value >> (int)rhsStatic.Value; }
+                else if (instruction.OpCode == OpCodes.Shr_Un) { result = (uint)lhsStatic.Value >> (int)rhsStatic.Value; }
                 else { throw new InvalidOperationException(); }
                 executionState.VirtualStack = executionState.VirtualStack.Push(new StaticStackValue { Value = result });
                 return FragmentText.Empty;
@@ -790,6 +792,9 @@ namespace CsToMips.Compiler
             else if (instruction.OpCode == OpCodes.And) { ic10 = "and"; }
             else if (instruction.OpCode == OpCodes.Or) { ic10 = "or"; }
             else if (instruction.OpCode == OpCodes.Xor) { ic10 = "xor"; }
+            else if (instruction.OpCode == OpCodes.Shl) { ic10 = "sll"; }
+            else if (instruction.OpCode == OpCodes.Shr) { ic10 = "srl"; }
+            else if (instruction.OpCode == OpCodes.Shr_Un) { ic10 = "srl"; }
             else { throw new InvalidOperationException(); }
             executionState.VirtualStack = executionState.VirtualStack.Push(new DeferredExpressionStackValue
             {
@@ -890,7 +895,7 @@ namespace CsToMips.Compiler
                 if (!found) { throw new InvalidOperationException(); }
             }
             CheckFree(ref executionState, switchValue);
-            return new FragmentText(sb.ToString(), null, branchTargets.ToImmutableArray());
+            return new FragmentText(sb.ToString(), branchTargets.ToImmutableArray());
         }
 
         [OpCodeHandler(@"ret")]
@@ -903,14 +908,19 @@ namespace CsToMips.Compiler
                 {
                     return new FragmentText($"j {localLabelPrefix}_end");
                 }
-                if (returnStackValue is not RegisterStackValue registerStackValue) { throw new InvalidOperationException(); }
-                executionState.VirtualStack = executionState.VirtualStack.Pop(out var retVal);
-                if (retVal is DeferredExpressionStackValue deferredExpressionStackValue)
+                if (returnStackValue != null)
                 {
-                    return deferredExpressionStackValue.ExpressionText.Replace("$", registerStackValue.AsIC10) + new FragmentText($"j {localLabelPrefix}_end");
+                    if (returnStackValue is not RegisterStackValue registerStackValue) { throw new InvalidOperationException(); }
+                    executionState.VirtualStack = executionState.VirtualStack.Pop(out var retVal);
+                    if (retVal is DeferredExpressionStackValue deferredExpressionStackValue)
+                    {
+                        return deferredExpressionStackValue.ExpressionText.Replace("$", registerStackValue.AsIC10) + new FragmentText($"j {localLabelPrefix}_end");
+                    }
+                    CheckFree(ref executionState, retVal);
+                    return new FragmentText($"move {registerStackValue.AsIC10} {retVal.AsIC10}{Environment.NewLine}j {localLabelPrefix}_end");
                 }
-                CheckFree(ref executionState, retVal);
-                return new FragmentText($"move {registerStackValue.AsIC10} {retVal.AsIC10}{Environment.NewLine}j {localLabelPrefix}_end");
+                executionState.VirtualStack = executionState.VirtualStack.Pop(out returnStackValue);
+                return new FragmentText($"j {localLabelPrefix}_end");
             }
             else
             {
@@ -965,85 +975,72 @@ namespace CsToMips.Compiler
             }
         }
 
-        public void FixupCallSites(IReadOnlyDictionary<MethodBase, (ExecutionContext, OutputWriter)> contexts, OutputWriter outputWriter)
+        private FragmentText GenerateCallSite(string labelPrefix, MethodInfo callTarget, StackValue[] callParams, ref ExecutionState executionState)
         {
-            foreach (var callSite in allCallSites)
+            // Try and inline the method first
+            var inlineCallText = TryGenerateInlineCallSite(labelPrefix, callTarget, callParams, ref executionState);
+            if (inlineCallText != null) { return inlineCallText.Value; }
+
+            // Inline failed, do a regular call stack call instead
+            throw new NotImplementedException();
+
+            // inlineContext.FixupCallSites(contexts, inlineOutputWriter);
+
+            /*methodDependencies.Add(method);
+            StackValue? returnParam = null;
+            if (callTarget.ReturnType != typeof(void))
             {
-                var (methodContext, methodOutputWriter) = contexts[callSite.Binding.TargetMethod];
-                FixupCallSite(contexts, callSite, methodContext, methodOutputWriter, outputWriter);
+                var regIdx = AllocateRegister(ref executionState);
+                var regValue = new RegisterStackValue { RegisterIndex = regIdx };
+                executionState.VirtualStack = executionState.VirtualStack.Push(regValue);
+                returnParam = regValue;
             }
+            var preReturnRegisterAllocs = executionState.RegisterAllocations;
+            CheckFree(ref executionState, callParams);
+            return new FragmentText(string.Empty, new CallBinding(method, callParams, returnParam, preReturnRegisterAllocs));*/
         }
 
-        private void FixupCallSite(IReadOnlyDictionary<MethodBase, (ExecutionContext, OutputWriter)> contexts, in CallSite callSite, ExecutionContext methodContext, OutputWriter methodOutputWriter, OutputWriter outputWriter)
+        private FragmentText? TryGenerateInlineCallSite(string labelPrefix, MethodInfo callTarget, StackValue[] callParams, ref ExecutionState executionState)
         {
-            if (ShouldInline(callSite, methodContext, methodOutputWriter))
-            {
-                GenerateInlineCall(contexts, callSite, methodContext, outputWriter);
-            }
-            else
-            {
-                GenerateCallStackCall(contexts, callSite, methodContext, outputWriter);
-            }
-        }
-
-        private bool ShouldInline(in CallSite callSite, ExecutionContext methodContext, OutputWriter methodOutputWriter)
-        {
-            if (!compilerOptions.AllowInlining) { return false; }
-            int totalWouldAllocate = methodContext.allUsedRegisters.NumAllocated + callSite.RegistersState.NumAllocated;
-            if (totalWouldAllocate >= RegisterAllocations.NumTotal) { return false; }
-            int callStackInstructionCount = EstimateCallStackCallInstructionCount(callSite, methodContext);
-            var inlineInstructionCount = methodOutputWriter.ToString().Split(Environment.NewLine).Length - 1;
-            // TODO: If there's only a single call ever to the target method, inlining would always result in less instructions, so discard this check
-            //if (inlineInstructionCount > callStackInstructionCount) { return false; }
-            return true;
-        }
-
-        private void GenerateCallStackCall(IReadOnlyDictionary<MethodBase, (ExecutionContext, OutputWriter)> contexts, in CallSite callSite, ExecutionContext methodContext, OutputWriter outputWriter)
-        {
-            var conflictingRegisters = methodContext.allUsedRegisters & callSite.RegistersState & ~reservedRegisters;
-            var sb = new StringBuilder();
-            for (int i = 0; i < RegisterAllocations.NumTotal; ++i)
-            {
-                if (conflictingRegisters.IsAllocated(i))
-                {
-                    sb.AppendLine($"push r{i}");
-                }
-            }
-            sb.AppendLine("push ra");
-            for (int i = 0; i < callSite.Binding.CallParams.Length; ++i)
-            {
-                sb.AppendLine($"push {callSite.Binding.CallParams[i].AsIC10}");
-            }
-            sb.AppendLine($"jal {callSite.Binding.TargetMethod.Name}");
-            sb.AppendLine("pop ra");
-            for (int i = 0; i < RegisterAllocations.NumTotal; ++i)
-            {
-                if (conflictingRegisters.IsAllocated(RegisterAllocations.NumTotal - (i + 1)))
-                {
-                    sb.AppendLine($"pop r{RegisterAllocations.NumTotal - (i + 1)}");
-                }
-            }
-            outputWriter.SetCode(callSite.InstructionIndex, sb.ToString().Trim());
-        }
-
-        private int EstimateCallStackCallInstructionCount(in CallSite callSite, ExecutionContext methodContext)
-        {
-            var conflictingRegisters = methodContext.allUsedRegisters & callSite.RegistersState & ~reservedRegisters;
-            return conflictingRegisters.NumAllocated + callSite.Binding.CallParams.Length + 3;
-        }
-
-        private void GenerateInlineCall(IReadOnlyDictionary<MethodBase, (ExecutionContext, OutputWriter)> contexts, in CallSite callSite, ExecutionContext methodContext, OutputWriter outputWriter)
-        {
-            // We can't rely on precompiled method code as it's designed to be called via the call stack, so recompile it inline
-            var registers = reservedRegisters | callSite.RegistersState;
-            if (callSite.Binding.ReturnParam is RegisterStackValue registerStackValue) { registers.Allocate(registerStackValue.RegisterIndex); }
-            var inlineContext = new ExecutionContext(compilerOptions, registers, callSite.Binding.TargetMethod, true, callSite.Binding.CallParams.Reverse(), callSite.Binding.ReturnParam);
-            var instructions = ILView.ToOpCodes(callSite.Binding.TargetMethod).ToArray();
+            var inlineContext = new ExecutionContext(compilerOptions, executionState.RegisterAllocations, callTarget, true, callParams.Reverse());
+            var instructions = ILView.ToOpCodes(callTarget).ToArray();
             var inlineOutputWriter = new OutputWriter(instructions.Length);
-            inlineOutputWriter.LabelPrefix = $"{outputWriter.GetLabel(callSite.InstructionIndex)}_inl";
+            inlineOutputWriter.LabelPrefix = labelPrefix;
             inlineContext.Compile(instructions, inlineOutputWriter);
-            inlineContext.FixupCallSites(contexts, inlineOutputWriter);
-            outputWriter.SetCode(callSite.InstructionIndex, inlineOutputWriter.ToString().Trim());
+            // TODO: Handle compile fail (e.g. went over register or instruction limit)
+            if (inlineContext.returnStackValue != null) { executionState.VirtualStack = executionState.VirtualStack.Push(inlineContext.returnStackValue); }
+            // TODO: If we're pushing a deferred expression here, it means there's still potentially some registers allocated by the inlined method in use but we're not tracking them in our own execution state
+            // We should pull any allocated registers across to ensure we don't accidentally reuse them too early
+            return new FragmentText(inlineOutputWriter.ToString());
+        }
+
+        private FragmentText? TryGenerateCallStackCallSite(string labelPrefix, MethodInfo callTarget, StackValue[] callParams, ref ExecutionState executionState)
+        {
+            throw new NotImplementedException();
+            //var conflictingRegisters = methodContext.allUsedRegisters & callSite.RegistersState & ~reservedRegisters;
+            //var sb = new StringBuilder();
+            //for (int i = 0; i < RegisterAllocations.NumTotal; ++i)
+            //{
+            //    if (conflictingRegisters.IsAllocated(i))
+            //    {
+            //        sb.AppendLine($"push r{i}");
+            //    }
+            //}
+            //sb.AppendLine("push ra");
+            //for (int i = 0; i < callSite.Binding.CallParams.Length; ++i)
+            //{
+            //    sb.AppendLine($"push {callSite.Binding.CallParams[i].AsIC10}");
+            //}
+            //sb.AppendLine($"jal {callSite.Binding.TargetMethod.Name}");
+            //sb.AppendLine("pop ra");
+            //for (int i = 0; i < RegisterAllocations.NumTotal; ++i)
+            //{
+            //    if (conflictingRegisters.IsAllocated(RegisterAllocations.NumTotal - (i + 1)))
+            //    {
+            //        sb.AppendLine($"pop r{RegisterAllocations.NumTotal - (i + 1)}");
+            //    }
+            //}
+            //outputWriter.SetCode(callSite.InstructionIndex, sb.ToString().Trim());
         }
 
         private StackValue[] GetCallParameters(ref ExecutionState executionState, MethodBase method)

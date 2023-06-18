@@ -59,10 +59,6 @@ namespace CsToMips.Compiler
                 CompileMethod("ctor", ctor, reservedRegisters, methodContextMap);
             }
             CompileMethod("main", runMethod, reservedRegisters, methodContextMap);
-            foreach (var pair in methodContextMap)
-            {
-                pair.Value.Item1.FixupCallSites(methodContextMap, pair.Value.Item2);
-            }
 
             foreach (var pair in methodContextMap)
             {

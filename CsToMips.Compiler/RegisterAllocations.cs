@@ -65,5 +65,16 @@
 
         public static RegisterAllocations operator ~(in RegisterAllocations lhs)
            => new RegisterAllocations(~lhs.allocated);
+
+        public static bool operator ==(in RegisterAllocations lhs, in RegisterAllocations rhs)
+            => lhs.allocated == rhs.allocated;
+
+        public static bool operator !=(in RegisterAllocations lhs, in RegisterAllocations rhs)
+            => lhs.allocated != rhs.allocated;
+
+        public override int GetHashCode()
+            => allocated.GetHashCode();
+
+        public override bool Equals(object? obj) => obj is RegisterAllocations registerAllocations && this == registerAllocations;
     }
 }

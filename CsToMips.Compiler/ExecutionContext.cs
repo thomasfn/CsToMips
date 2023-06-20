@@ -1,7 +1,10 @@
-﻿using System.Reflection;
+﻿using System;
+using System.Reflection;
 using System.Reflection.Emit;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Linq;
+using System.Collections.Generic;
 using System.Collections.Immutable;
 
 namespace CsToMips.Compiler
@@ -78,7 +81,7 @@ namespace CsToMips.Compiler
         }
     }
 
-    internal delegate FragmentText InstructionHandler(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState);
+    internal delegate FragmentText InstructionHandler(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState);
 
     internal class ExecutionContext
     {
@@ -113,8 +116,8 @@ namespace CsToMips.Compiler
             { typeof(Math).GetMethod("Sin", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "sin $ #0" },
             { typeof(Math).GetMethod("Sqrt", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "sqrt $ #0" },
             { typeof(Math).GetMethod("Tan", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "tan $ #0" },
-            { typeof(Math).GetMethod("Clamp", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double), typeof(double), typeof(double) })!, "max %1 #1 #0\nmin $ #2 %1" },
-            { typeof(Math).GetMethod("Clamp", BindingFlags.Public | BindingFlags.Static, new [] { typeof(float), typeof(float), typeof(float) })!, "max %1 #1 #0\nmin $ #2 %1" },
+            { typeof(Math).GetMethod("Clamp", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double), typeof(double), typeof(double) })!, $"max %1 #1 #0{Environment.NewLine}min $ #2 %1" },
+            { typeof(Math).GetMethod("Clamp", BindingFlags.Public | BindingFlags.Static, new [] { typeof(float), typeof(float), typeof(float) })!, $"max %1 #1 #0{Environment.NewLine}min $ #2 %1" },
 
             { typeof(float).GetMethod("IsNaN", BindingFlags.Public | BindingFlags.Static, new [] { typeof(float) })!, "snan $ #0" },
             { typeof(double).GetMethod("IsNaN", BindingFlags.Public | BindingFlags.Static, new [] { typeof(double) })!, "snan $ #0" },
@@ -183,7 +186,7 @@ namespace CsToMips.Compiler
             throw new NotImplementedException();
         }
 
-        public void Compile(ReadOnlySpan<Instruction> instructions, OutputWriter outputWriter)
+        public void Compile(ReadOnlySpan<ILInstruction> instructions, OutputWriter outputWriter)
         {
             localLabelPrefix = outputWriter.LabelPrefix;
             var preamble = new StringBuilder();
@@ -263,7 +266,7 @@ namespace CsToMips.Compiler
             }
         }
 
-        private Fragment? ProcessInstruction(ReadOnlySpan<Instruction> instructions, int instructionIndex, in ExecutionState executionState)
+        private Fragment? ProcessInstruction(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, in ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             foreach (var handlerDefinition in instructionHandlers)
@@ -285,11 +288,11 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"nop")]
-        private FragmentText Handle_Noop(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Noop(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
             => FragmentText.Empty;
 
         [OpCodeHandler(@"dup")]
-        private FragmentText Handle_Dup(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Dup(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var value = executionState.VirtualStack.Peek();
             if (value is DeferredExpressionStackValue)
@@ -303,14 +306,14 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"pop")]
-        private FragmentText Handle_Pop(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Pop(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             executionState.VirtualStack = executionState.VirtualStack.Pop(out _);
             return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"ldarg(\.[0-9])?")]
-        private FragmentText Handle_Ldarg(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Ldarg(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             if (instruction.OpCode == OpCodes.Ldarg_0 || (instruction.OpCode == OpCodes.Ldarg && (int)instruction.Data == 0))
@@ -326,7 +329,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"ldstr")]
-        private FragmentText Handle_Ldstr(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Ldstr(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             executionState.VirtualStack = executionState.VirtualStack.Push(new StringStackValue { Value = (string)instruction.Data });
@@ -334,14 +337,14 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"ldnull")]
-        private FragmentText Handle_Ldnull(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Ldnull(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             executionState.VirtualStack = executionState.VirtualStack.Push(new NullStackValue());
             return FragmentText.Empty;
         }
 
         [OpCodeHandler(@"ldind\.[a-z]+[0-9]*")]
-        private FragmentText Handle_Ldind(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Ldind(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             executionState.VirtualStack = executionState.VirtualStack.Pop(out var value);
@@ -354,7 +357,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"ldfld")]
-        private FragmentText Handle_Ldfld(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Ldfld(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             executionState.VirtualStack = executionState.VirtualStack.Pop(out var value);
@@ -381,7 +384,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"stfld")]
-        private FragmentText Handle_Stfld(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Stfld(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             executionState.VirtualStack = executionState.VirtualStack.Pop2(out var value, out var target);
@@ -405,7 +408,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"call(virt)?")]
-        private FragmentText Handle_Call(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Call(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             var method = instruction.Data as MethodBase;
@@ -590,7 +593,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"b(r|eq|ge|gt|le|lt|ne|rfalse|rtrue|rzero)(\.un)?(\.s)?")]
-        private FragmentText Handle_Branch(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Branch(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             int offset;
@@ -657,7 +660,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"ldc(\.[ir][0-9](\.(m)?[0-9])?)?(\.s)?")]
-        private FragmentText Handle_Ldc(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Ldc(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             StackValue valueToPush;
@@ -681,7 +684,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"stloc(\.[0-9]|\.s)?")]
-        private FragmentText Handle_Stloc(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Stloc(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             int localVariableIndex;
@@ -722,7 +725,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"ldloc(\.[0-9]|\.s)?")]
-        private FragmentText Handle_Ldloc(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Ldloc(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             int localVariableIndex;
@@ -744,7 +747,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"ldloca(\.s)?")]
-        private FragmentText Handle_Ldloca(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Ldloca(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             int localVariableIndex;
@@ -761,7 +764,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"add|sub|mul|div|and|or|xor|shl|shr")]
-        private FragmentText Handle_BinaryArithmetic(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_BinaryArithmetic(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             executionState.VirtualStack = executionState.VirtualStack.Pop2(out var rhs, out var lhs);
@@ -805,7 +808,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"not")]
-        private FragmentText Handle_UnaryArithmetic(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_UnaryArithmetic(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             executionState.VirtualStack = executionState.VirtualStack.Pop(out var rhs);
@@ -822,7 +825,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"neg")]
-        private FragmentText Handle_Neg(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Neg(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             executionState.VirtualStack = executionState.VirtualStack.Pop(out var rhs);
             rhs = ResolveInputValue(rhs, ref executionState);
@@ -835,7 +838,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"(ceq|cgt|clt)(\.un)?")]
-        private FragmentText Handle_Compare(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Compare(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             executionState.VirtualStack = executionState.VirtualStack.Pop2(out var rhs, out var lhs);
@@ -868,7 +871,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"switch")]
-        private FragmentText Handle_Switch(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Switch(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             executionState.VirtualStack = executionState.VirtualStack.Pop(out var switchValue);
@@ -899,7 +902,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"ret")]
-        private FragmentText Handle_Ret(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Ret(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             if (method.IsConstructor || method is not MethodInfo methodInfo) { return FragmentText.Empty; }
             if (isInline)
@@ -937,7 +940,7 @@ namespace CsToMips.Compiler
         }
 
         [OpCodeHandler(@"conv\..+")]
-        private FragmentText Handle_Conv(ReadOnlySpan<Instruction> instructions, int instructionIndex, ref ExecutionState executionState)
+        private FragmentText Handle_Conv(ReadOnlySpan<ILInstruction> instructions, int instructionIndex, ref ExecutionState executionState)
         {
             var instruction = instructions[instructionIndex];
             // since ic10 only has f32 registers, the only conv we're interested in emitting for is f -> i

@@ -1,4 +1,6 @@
 ﻿using System;
+using System.IO;
+using System.Collections.Generic;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Text;
@@ -6,7 +8,7 @@ using System.Text.RegularExpressions;
 
 namespace CsToMips.Compiler
 {
-    public readonly struct Instruction
+    public readonly struct ILInstruction
     {
         public readonly int Offset;
         public readonly int Size;
@@ -15,7 +17,7 @@ namespace CsToMips.Compiler
 
         static readonly Regex TrimVersion = new Regex(", Version=.+, Culture=.+, PublicKeyToken=[0-9a-z]+", RegexOptions.Compiled);
 
-        public Instruction(int offset, int size, OpCode opCode, object data)
+        public ILInstruction(int offset, int size, OpCode opCode, object data)
         {
             Offset = offset;
             Size = size;
@@ -144,7 +146,7 @@ namespace CsToMips.Compiler
             return sb.ToString();
         }
 
-        public static IEnumerable<Instruction> ToOpCodes(MethodBase method)
+        public static IEnumerable<ILInstruction> ToOpCodes(MethodBase method)
         {
             var body = method.GetMethodBody();
             if (body == null) yield break;
@@ -245,7 +247,7 @@ namespace CsToMips.Compiler
 
                     var finalPosition = reader.CurrentPosition;
 
-                    yield return new Instruction(position, finalPosition - position, opCode, data);
+                    yield return new ILInstruction(position, finalPosition - position, opCode, data);
                 }
             }
         }

@@ -1,4 +1,6 @@
-﻿namespace CsToMips.Compiler
+﻿using System;
+
+namespace CsToMips.Compiler
 {
     internal readonly struct RegisterAllocations
     {

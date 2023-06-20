@@ -1,5 +1,8 @@
-﻿using System.Collections.Immutable;
+﻿using System;
+using System.Collections.Immutable;
+using System.Collections.Generic;
 using System.Reflection;
+using System.Linq;
 
 namespace CsToMips.Compiler
 {

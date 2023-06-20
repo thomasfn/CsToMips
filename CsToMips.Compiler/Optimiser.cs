@@ -1,50 +1,231 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace CsToMips.Compiler
 {
-    internal enum IC10InstructionKind
-    {
-        Instruction,
-        Label
-    }
-
-    internal readonly struct IC10Instruction
-    {
-        public readonly string OpCode;
-        public readonly IC10InstructionKind Kind;
-        private readonly string[] operands;
-
-        public ReadOnlySpan<string> Operands => operands;
-
-        public IC10Instruction(string opCode, IC10InstructionKind kind, ReadOnlySpan<string> operands)
-        {
-            OpCode = opCode;
-            Kind = kind;
-            this.operands = operands.ToArray();
-        }
-
-        public IC10Instruction ReplaceOperand(int operandIndex, string newValue)
-        {
-            if (operandIndex < 0 || operandIndex >= operands.Length) { throw new ArgumentOutOfRangeException(nameof(operandIndex)); }
-            var newOperands = new string[operands.Length];
-            Operands.CopyTo(newOperands);
-            newOperands[operandIndex] = newValue;
-            return new IC10Instruction(OpCode, Kind, newOperands);
-        }
-
-        public bool IsUnconditionalJump => Kind == IC10InstructionKind.Instruction && (OpCode == "j" || OpCode == "jal");
-
-        public bool IsUnconditionalJumpNoReturn => Kind == IC10InstructionKind.Instruction && OpCode == "j";
-
-        public override string ToString() => Kind == IC10InstructionKind.Instruction ? $"{OpCode.ToLowerInvariant()} {string.Join(" ", operands)}" : $"{OpCode}:";
-    }
+    using MIPS;
 
     internal class Optimiser
     {
+        private readonly struct EditableProgram
+        {
+            public readonly IList<Instruction> Instructions;
+            public readonly IList<Label> Labels;
+
+            public EditableProgram(in Program program)
+            {
+                Instructions = new List<Instruction>(program.Instructions.ToArray());
+                Labels = new List<Label>(program.Labels.ToArray());
+            }
+
+            public Program ToProgram()
+                => new (Instructions.ToArray(), Labels.ToArray());
+
+            public MIPS.FlowAnalysis GetFlowAnalysis() => MIPS.FlowAnalysis.Build(ToProgram());
+
+            public delegate Instruction? InstructionVisitor(int instructionIndex, in Instruction instruction);
+
+            public delegate Label? LabelVisitor(int labelIndex, in Label label);
+
+            public void VisitInstructions(InstructionVisitor visitor)
+            {
+                for (int i = 0; i < Instructions.Count; ++i)
+                {
+                    var instruction = Instructions[i];
+                    var newInstruction = visitor(i, instruction);
+                    if (newInstruction == null)
+                    {
+                        RemoveInstruction(i);
+                        --i;
+                        continue;
+                    }
+                    Instructions[i] = newInstruction.Value;
+                }
+            }
+
+            public void VisitLabels(LabelVisitor visitor)
+            {
+                for (int i = 0; i < Labels.Count; ++i)
+                {
+                    var label = Labels[i];
+                    var newLabel = visitor(i, label);
+                    if (newLabel == null)
+                    {
+                        RemoveLabel(i);
+                        --i;
+                        continue;
+                    }
+                    Labels[i] = newLabel.Value;
+                }
+            }
+
+            public int? FindLabel(int instructionIndex)
+            {
+                for (int i = 0; i < Labels.Count; ++i)
+                {
+                    if (Labels[i].InstructionIndex == instructionIndex) { return i; }
+                }
+                return null;
+            }
+
+            public int? FindLabel(string text)
+            {
+                for (int i = 0; i < Labels.Count; ++i)
+                {
+                    if (Labels[i].Text == text) { return i; }
+                }
+                return null;
+            }
+
+            public int FindOrCreateLabel(int instructionIndex, string? defaultName = null)
+            {
+                for (int i = 0; i < Labels.Count; ++i)
+                {
+                    if (Labels[i].InstructionIndex == instructionIndex) { return i; }
+                }
+                Labels.Add(new Label(defaultName ?? $"_{instructionIndex}", instructionIndex));
+                return Labels.Count - 1;
+            }
+
+            public int GetJumpTarget(int instructionIndex)
+            {
+                var instruction = Instructions[instructionIndex];
+                var desc = instruction.OpCode.GetDescription();
+                var jumpTargetOperand = instruction.Operands[^1];
+                int? jumpTarget;
+                switch (desc.Behaviour)
+                {
+                    case OpCodeBehaviour.RelativeJump:
+                        if (jumpTargetOperand.Type != OperandValueType.Static)
+                        {
+                            jumpTarget = null;
+                            break;
+                        }
+                        jumpTarget = GetNextInstruction(instruction.LineIndex + jumpTargetOperand.IntValue);
+                        break;
+                    case OpCodeBehaviour.Jump:
+                    case OpCodeBehaviour.JumpWithReturn:
+                        if (jumpTargetOperand.Type != OperandValueType.Name)
+                        {
+                            jumpTarget = null;
+                            break;
+                        }
+                        var labelIndex = FindLabel(jumpTargetOperand.TextValue);
+                        if (labelIndex == null)
+                        {
+                            jumpTarget = null;
+                            break;
+                        }
+                        jumpTarget = Labels[labelIndex.Value].InstructionIndex;
+                        break;
+                    default:
+                        jumpTarget = null;
+                        break;
+                }
+                if (jumpTarget == null) { throw new InvalidOperationException($"Instruction was not a jump or was invalid"); }
+                return jumpTarget.Value;
+            }
+
+            public int? GetNextInstruction(int lineIndex)
+            {
+                for (int instructionIndex = 0; instructionIndex < Instructions.Count; ++instructionIndex)
+                {
+                    if (Instructions[instructionIndex].LineIndex >= lineIndex)
+                    {
+                        return instructionIndex;
+                    }
+                }
+                return null;
+            }
+
+            public void RemoveInstruction(int instructionIndex)
+            {
+                for (int i = Labels.Count - 1; i >= 0; --i)
+                {
+                    if (Labels[i].InstructionIndex == instructionIndex)
+                    {
+                        Labels.RemoveAt(i);
+                    }
+                    else if (Labels[i].InstructionIndex > instructionIndex)
+                    {
+                        Labels[i] = new Label(Labels[i].Text, Labels[i].InstructionIndex - 1);
+                    }
+                }
+                Instructions.RemoveAt(instructionIndex);
+                // TODO: Technically we should be rewriting relative jump instructions and correcting the jump offset to account for the removed instruction, but since we don't use relative jumps, for now don't bother
+            }
+
+            public void RemoveLabel(int labelIndex)
+            {
+                // TODO: Check or do something about instructions that reference the label
+                Labels.RemoveAt(labelIndex);
+            }
+
+            public void InsertInstruction(int instructionIndex, Instruction instruction)
+            {
+                for (int i = Labels.Count - 1; i >= 0; --i)
+                {
+                    if (Labels[i].InstructionIndex >= instructionIndex)
+                    {
+                        Labels[i] = new Label(Labels[i].Text, Labels[i].InstructionIndex + 1);
+                    }
+                }
+                Instructions.Insert(instructionIndex, instruction);
+                // TODO: Technically we should be rewriting relative jump instructions and correcting the jump offset to account for the removed instruction, but since we don't use relative jumps, for now don't bother
+            }
+
+            public void Splice(EditableProgram program, int instructionIndex)
+            {
+                for (int i = 0; i < program.Instructions.Count; ++i)
+                {
+                    Instructions.Insert(instructionIndex + i, program.Instructions[i]);
+                }
+                for (int i = Labels.Count - 1; i >= 0; --i)
+                {
+                    if (Labels[i].InstructionIndex >= instructionIndex)
+                    {
+                        Labels[i] = new Label(Labels[i].Text, Labels[i].InstructionIndex + program.Instructions.Count);
+                    }
+                }
+                foreach (var label in program.Labels)
+                {
+                    Labels.Add(new Label(label.Text, label.InstructionIndex + instructionIndex));
+                }
+            }
+
+            public void Append(EditableProgram program)
+            {
+                var startIdx = Instructions.Count;
+                for (int i = 0; i < program.Instructions.Count; ++i)
+                {
+                    Instructions.Add(program.Instructions[i]);
+                }
+                foreach (var label in program.Labels)
+                {
+                    Labels.Add(new Label(label.Text, label.InstructionIndex + startIdx));
+                }
+            }
+
+            public EditableProgram Slice(int instructionIndex, int instructionCount)
+            {
+                var result = new EditableProgram(Program.Blank);
+                for (int i = 0; i < instructionCount; ++i)
+                {
+                    result.Instructions.Add(Instructions[i + instructionIndex]);
+                }
+                foreach (var label in Labels)
+                {
+                    if (label.InstructionIndex < instructionIndex || label.InstructionIndex >= instructionIndex + instructionCount) { continue; }
+                    result.Labels.Add(new Label(label.Text, label.InstructionIndex - instructionIndex));
+                }
+                return result;
+            }
+
+            public override string ToString()
+                => ToProgram().ToString();
+        }
+
         public string Optimise(string ic10)
         {
             var lines = ic10.Split(Environment.NewLine);
@@ -53,273 +234,166 @@ namespace CsToMips.Compiler
 
         private string Optimise(ReadOnlySpan<string> lines)
         {
-            var instructions = new List<IC10Instruction>();
-            foreach (var line in lines)
-            {
-                var cleanedLine = line.Trim();
-                if (string.IsNullOrEmpty(cleanedLine)) { continue; }
-                if (cleanedLine[^1] == ':')
-                {
-                    instructions.Add(new IC10Instruction(line[0..^1], IC10InstructionKind.Label, ReadOnlySpan<string>.Empty));
-                    continue;
-                }
-                var pieces = cleanedLine.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-                if (pieces.Length < 1) { continue; }
-                instructions.Add(new IC10Instruction(pieces[0], IC10InstructionKind.Instruction, pieces.AsSpan().Slice(1)));
-            }
-            Optimise(instructions);
-            var sb = new StringBuilder();
-            foreach (var instruction in instructions)
-            {
-                sb.AppendLine(instruction.ToString());
-            }
-            return sb.ToString().Trim();
+            var program = MIPS.Program.Parse(lines);
+            var editableProgram = new EditableProgram(program);
+            Optimise(editableProgram);
+            return editableProgram.ToProgram().ToString();
         }
 
-        private void Optimise(IList<IC10Instruction> instructions)
+        private void Optimise(EditableProgram program)
         {
-            bool changesMade;
-            do
-            {
-                changesMade = false;
-                changesMade |= Optimise_RedundantStackUsage(instructions);
-                changesMade |= Optimise_RedundantJumps(instructions);
-                changesMade |= Optimise_InlineSmallSections(instructions);
-                changesMade |= Optimise_ChainLabels(instructions);
-                changesMade |= Optimise_ChainJumps(instructions);
-                changesMade |= Optimise_UnusedLabels(instructions);
-                changesMade |= Optimise_UnreachableCode(instructions);
-                changesMade |= Optimise_RedundantMoves(instructions);
-            }
-            while (changesMade);
+            Optimise_NormaliseJumps(program);
+            Optimise_ControlFlow(program);
+            Optimise_RedundantJumps(program);
+            Optimise_RedundantLabels(program);
         }
 
-        private bool Optimise_RedundantStackUsage(IList<IC10Instruction> instructions)
+        private void Optimise_NormaliseJumps(EditableProgram program)
         {
-            bool changesMade = false;
-            for (int i = 0; i < instructions.Count - 1; ++i)
+            // Convert all relative jumps to absolute ones - insert labels where needed
+            // This will allow us to remove and reorder instructions easily as long as we keep label consistency
+            for (int i = 0; i < program.Instructions.Count; ++i)
             {
-                var instruction = instructions[i];
-                var nextInstruction = instructions[i + 1];
-                if (instruction.OpCode == "pop" && nextInstruction.OpCode == "push" && instruction.Operands[0] == "ra" && nextInstruction.Operands[0] == "ra")
+                var instruction = program.Instructions[i];
+                var desc = instruction.OpCode.GetDescription();
+                if (desc.Behaviour == OpCodeBehaviour.RelativeJump)
                 {
-                    instructions.RemoveAt(i + 1);
-                    instructions.RemoveAt(i);
-                    --i;
-                    changesMade |= true;
+                    var jumpTargetOperand = instruction.Operands[^1];
+                    if (jumpTargetOperand.Type != OperandValueType.Static) { throw new InvalidOperationException($"Relative jumps to non-static values are not supported"); }
+                    var jumpTarget = program.GetNextInstruction(instruction.LineIndex + jumpTargetOperand.IntValue);
+                    if (jumpTarget == null) { continue; }
+                    var label = program.Labels[program.FindOrCreateLabel(jumpTarget.Value)].Text;
+                    instruction = instruction.RewriteBehaviour(OpCodeBehaviour.Jump).SetOperand(^1, OperandValue.FromName(label));
+                    program.Instructions[i] = instruction;
                 }
             }
-            return changesMade;
         }
 
-        private bool Optimise_RedundantJumps(IList<IC10Instruction> instructions)
+        private void Optimise_ControlFlow(EditableProgram program)
         {
-            bool changesMade = false;
-            for (int i = 0; i < instructions.Count - 1; ++i)
+            
             {
-                var instruction = instructions[i];
-                var nextInstruction = instructions[i + 1];
-                if (instruction.OpCode == "j" && nextInstruction.Kind == IC10InstructionKind.Label && instruction.Operands[0] == nextInstruction.OpCode)
-                {
-                    instructions.RemoveAt(i);
-                    --i;
-                    changesMade |= true;
-                }
-            }
-            return changesMade;
-        }
+                var flowAnalysis = program.GetFlowAnalysis();
 
-        private bool Optimise_InlineSmallSections(IList<IC10Instruction> instructions)
-        {
-            bool changesMade = false;
-            for (int i = 0; i < instructions.Count - 1; ++i)
-            {
-                var instruction = instructions[i];
-                var nextInstruction = instructions[i + 1];
-                if (instruction.Kind == IC10InstructionKind.Label)
+                // Rewrite jump-with-return instructions to just jumps if there is no flow back to them
+                program.VisitInstructions((int instructionIndex, in Instruction instruction) =>
                 {
-                    var sectionSize = GetSectionFiniteSize(instructions, instruction.OpCode);
-                    if (sectionSize == null || sectionSize > 1) { continue; }
-                    var refs = FindLabelRefs(instructions, instruction.OpCode).ToArray();
-                    foreach (var (instructionIndex, _) in refs)
+                    var blockIndex = flowAnalysis.FindBlockContaining(instructionIndex);
+                    if (blockIndex == null) { return instruction; }
+                    var block = flowAnalysis.Blocks[blockIndex.Value];
+                    if (block.FirstInstructionIndex == instructionIndex || block.LastInstructionIndex > instructionIndex) { return instruction; }
+                    var desc = instruction.OpCode.GetDescription();
+                    if (desc.Behaviour != OpCodeBehaviour.JumpWithReturn) { return instruction; }
+                    return instruction.RewriteBehaviour(OpCodeBehaviour.Jump);
+                });
+
+                // Reorder blocks and exclude unreachable ones
+                var blocks = new List<int>();
+                var remainingBlocks = new List<int>(Enumerable.Range(0, flowAnalysis.Blocks.Length));
+                while (remainingBlocks.Count > 0)
+                {
+                    int? nextBlockIdx = null;
+
+                    if (blocks.Count == 0)
                     {
-                        if (instructions[instructionIndex].IsUnconditionalJumpNoReturn)
-                        {
-                            instructions[instructionIndex] = nextInstruction;
-                            changesMade |= true;
-                        }
-                        // TODO: the ref could be a conditional jump e.g. begz, we could still inline the section IF the section only consists of a single "j"
-                    }
-                    
-                }
-            }
-            return changesMade;
-        }
-
-        private bool Optimise_ChainLabels(IList<IC10Instruction> instructions)
-        {
-            bool changesMade = false;
-            for (int i = 0; i < instructions.Count - 1; ++i)
-            {
-                var instruction = instructions[i];
-                var nextInstruction = instructions[i + 1];
-                if (instruction.Kind != IC10InstructionKind.Label || nextInstruction.Kind != IC10InstructionKind.Label) { continue; }
-                FixupLabelRefs(instructions, nextInstruction.OpCode, instruction.OpCode);
-                instructions.RemoveAt(i + 1);
-                changesMade |= true;
-            }
-            return changesMade;
-        }
-
-        private bool Optimise_ChainJumps(IList<IC10Instruction> instructions)
-        {
-            bool changesMade = false;
-            for (int i = 0; i < instructions.Count - 1; ++i)
-            {
-                var instruction = instructions[i];
-                var nextInstruction = instructions[i + 1];
-                if (instruction.Kind != IC10InstructionKind.Label || !(nextInstruction.Kind == IC10InstructionKind.Instruction && nextInstruction.OpCode == "j")) { continue; }
-                FixupLabelRefs(instructions, instruction.OpCode, nextInstruction.Operands[0]);
-                changesMade |= true;
-            }
-            return changesMade;
-        }
-
-        private bool Optimise_UnusedLabels(IList<IC10Instruction> instructions)
-        {
-            bool changesMade = false;
-            for (int i = 0; i < instructions.Count; ++i)
-            {
-                var instruction = instructions[i];
-                if (instruction.Kind == IC10InstructionKind.Label && !FindLabelRefs(instructions, instruction.OpCode).Any())
-                {
-                    instructions.RemoveAt(i);
-                    --i;
-                    changesMade |= true;
-                }
-            }
-            return changesMade;
-        }
-
-        private bool Optimise_UnreachableCode(IList<IC10Instruction> instructions)
-        {
-            bool changesMade = false;
-            for (int i = 0; i < instructions.Count; ++i)
-            {
-                var instruction = instructions[i];
-                if (instruction.Kind == IC10InstructionKind.Instruction && instruction.OpCode == "j")
-                {
-                    ++i;
-                    while (i < instructions.Count && instructions[i].Kind != IC10InstructionKind.Label)
-                    {
-                        instructions.RemoveAt(i);
-                        changesMade |= true;
-                    }
-                }
-            }
-            return changesMade;
-        }
-
-        private bool Optimise_RedundantMoves(IList<IC10Instruction> instructions)
-        {
-            bool changesMade = false;
-            Span<float?> knownRegisterValues = stackalloc float?[RegisterAllocations.NumTotal];
-            Span<int?> lastWrite = stackalloc int?[RegisterAllocations.NumTotal];
-            Span<int?> lastRead = stackalloc int?[RegisterAllocations.NumTotal];
-            for (int i = 0; i < instructions.Count; ++i)
-            {
-                var instruction = instructions[i];
-                if (instruction.Kind == IC10InstructionKind.Instruction && instruction.OpCode == "move")
-                {
-                    if (instruction.Operands[0] == instruction.Operands[1])
-                    {
-                        // e.g. "move r1 r1"
-                        instructions.RemoveAt(i);
-                        changesMade |= true;
-                        --i;
-                        continue;
-                    }
-                    if (int.TryParse(instruction.Operands[0][1..], out int regIdx))
-                    {
-                        if (float.TryParse(instruction.Operands[1], out float staticValue))
-                        {
-                            knownRegisterValues[regIdx] = staticValue;
-                        }
-                        else
-                        {
-                            knownRegisterValues[regIdx] = null;
-                        }
-                        lastWrite[regIdx] = i;
+                        // Entrypoint block always comes first
+                        nextBlockIdx = 0;
                     }
                     else
                     {
-                        // Could be a label or indirection, assume the worst
-                        knownRegisterValues.Fill(null);
+                        // Search blocks for one we can put next
+                        for (int i = blocks.Count - 1; i >= 0; --i)
+                        {
+                            var block = flowAnalysis.Blocks[i];
+                            foreach (var followState in block.FollowStates)
+                            {
+                                if (!remainingBlocks.Contains(followState.BlockIndex)) { continue; }
+                                // Also check if this candidate has any natural enter states - if it does we can't place it next unless it's naturally following this one
+                                if (flowAnalysis.Blocks[followState.BlockIndex].EnterStates.Any(s => s.Natural))
+                                {
+                                    continue;
+                                }
+                                nextBlockIdx = followState.BlockIndex;
+                            }
+                            if (nextBlockIdx != null) { break; }
+                        }
                     }
-                    continue;
+
+                    if (nextBlockIdx == null)
+                    {
+                        // All remaining blocks contain unreachable code
+                        break;
+                    }
+
+                    remainingBlocks.Remove(nextBlockIdx.Value);
+                    blocks.Add(nextBlockIdx.Value);
+
+                    // If the block we just added has a natural follow state, this must always come next
+                    var lastBlockAddedIdx = blocks[blocks.Count - 1];
+                    while (flowAnalysis.Blocks[lastBlockAddedIdx].FollowStates.Any(s => s.Natural))
+                    {
+                        var followBlockIdx = lastBlockAddedIdx + 1;
+                        if (!remainingBlocks.Remove(followBlockIdx))
+                        {
+                            throw new InvalidOperationException($"Block {lastBlockAddedIdx} has a natural follow state to block {followBlockIdx} but {followBlockIdx} was already added to the list!");
+                        }
+                        blocks.Add(followBlockIdx);
+                        lastBlockAddedIdx = followBlockIdx;
+                    }
                 }
-                // If a jump lands here, we can't know what happened to the registers before the jump, so assume the worst
-                if (instruction.Kind == IC10InstructionKind.Label)
+                var blockPrograms = new EditableProgram[blocks.Count];
+                for (int i = 0; i < blocks.Count; ++i)
                 {
-                    knownRegisterValues.Fill(null);
-                    continue;
+                    var block = flowAnalysis.Blocks[blocks[i]];
+                    blockPrograms[i] = program.Slice(block.FirstInstructionIndex, (block.LastInstructionIndex - block.FirstInstructionIndex) + 1);
                 }
-                // TODO: realisticly this is going to be too complex to implement without flow analysis or better instruction metadata
-                // So let's leave this half-implemented for now and come back to this later
-
-            }
-            return changesMade;
-        }
-
-        private bool FixupLabelRefs(IList<IC10Instruction> instructions, string labelName, string replaceLabelName)
-        {
-            bool changesMade = false;
-            foreach (var (instructionIndex, operandIndex) in FindLabelRefs(instructions, labelName))
-            {
-                if (instructions[instructionIndex].Operands[operandIndex] != labelName) { continue; }
-                instructions[instructionIndex] = instructions[instructionIndex].ReplaceOperand(operandIndex, replaceLabelName);
-                changesMade |= true;
-            }
-            return changesMade;
-        }
-
-        private IEnumerable<(int instructionIndex, int operandIndex)> FindLabelRefs(IList<IC10Instruction> instructions, string labelName)
-        {
-            for (int i = 0; i < instructions.Count; ++i)
-            {
-                var instruction = instructions[i];
-                for (int j = 0; j < instruction.Operands.Length; ++j)
+                program.Instructions.Clear();
+                program.Labels.Clear();
+                for (int i = 0; i < blockPrograms.Length; ++i)
                 {
-                    if (instruction.Operands[j] != labelName) { continue; }
-                    yield return (i, j);
+                    program.Append(blockPrograms[i]);
                 }
             }
+
         }
 
-        private int? GetSectionFiniteSize(IList<IC10Instruction> instructions, string labelName)
+        private void Optimise_RedundantJumps(EditableProgram program)
         {
-            int? sectionStart = FindLabel(instructions, labelName);
-            if (sectionStart == null) { return null; }
-            int length = 0;
-            for (int i = sectionStart.Value + 1; i < instructions.Count; ++i)
+            program.VisitInstructions((int instructionIndex, in Instruction instruction) =>
             {
-                ++length;
-                if (instructions[i].IsUnconditionalJumpNoReturn) { break; }
-            }
-            return length;
-        }
-
-        private int? FindLabel(IList<IC10Instruction> instructions, string labelName)
-        {
-            for (int i = 0; i < instructions.Count; ++i)
-            {
-                var instruction = instructions[i];
-                if (instruction.Kind == IC10InstructionKind.Label && instruction.OpCode == labelName)
+                var desc = instruction.OpCode.GetDescription();
+                if (desc.IsJump)
                 {
-                    return i;
+                    var jumpTarget = program.GetJumpTarget(instructionIndex);
+                    if (jumpTarget == instructionIndex + 1)
+                    {
+                        return null;
+                    }
                 }
-            }
-            return null;
+                return instruction;
+            });
         }
+
+        private void Optimise_RedundantLabels(EditableProgram program)
+        {
+            var names = new HashSet<string>();
+            program.VisitInstructions((int instructionIndex, in Instruction instruction) =>
+            {
+                foreach (var operand in instruction.Operands)
+                {
+                    names.Add(operand.TextValue);
+                }
+                return instruction;
+            });
+            program.VisitLabels((int labelIndex, in Label label) =>
+            {
+                if (!names.Contains(label.Text))
+                {
+                    return null;
+                }
+                return label;
+            });
+        }
+
     }
 }
